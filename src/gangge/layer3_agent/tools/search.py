@@ -92,10 +92,14 @@ class GrepTool(BaseTool):
             for fname in filenames:
                 # Filter by include pattern
                 if include:
-                    if not any(
-                        fname.endswith(ext.strip())
-                        for ext in include.split(",")
-                    ):
+                    # Support patterns like "*.py" or ".py" or "*.py,*.ts"
+                    exts = []
+                    for ext in include.split(","):
+                        ext = ext.strip()
+                        if ext.startswith("*"):
+                            ext = ext[1:]  # Remove leading *
+                        exts.append(ext)
+                    if not any(fname.endswith(ext) for ext in exts):
                         continue
 
                 # Skip binary files
