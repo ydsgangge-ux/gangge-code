@@ -95,10 +95,13 @@ class PermissionBar(Static):
     def __init__(self, **kwargs):
         super().__init__("", **kwargs)
         self.pending_request: PermissionRequest | None = None
-        self._event = asyncio.Event()
+        self._decision: PermissionDecision | None = None
+        self._decision_event: asyncio.Event | None = None
 
     def show_request(self, request: PermissionRequest) -> None:
         self.pending_request = request
+        self._decision = None
+        self._decision_event = asyncio.Event()
         risk_icon = {
             "safe": "[green]●[/]",
             "low": "[yellow]●[/]",
@@ -113,16 +116,18 @@ class PermissionBar(Static):
             f"[dim]({request.risk.level.value})[/dim]   "
             f"[green](Y)允许[/] / [red](N)拒绝[/] / [dim](A)总是允许[/]"
         )
-        self._event.clear()
 
     def respond(self, decision: PermissionDecision) -> None:
         self.pending_request = None
+        self._decision = decision
         self.update("")
-        self._event.set()
+        if self._decision_event:
+            self._decision_event.set()
 
     async def wait_for_response(self) -> PermissionDecision:
-        await self._event.wait()
-        return PermissionDecision.ALLOW
+        if self._decision_event:
+            await self._decision_event.wait()
+        return self._decision or PermissionDecision.ALLOW
 
 
 class StatusLine(Static):
@@ -395,7 +400,8 @@ class GanggeApp(App):
         """Permission callback — show in UI and wait for user response."""
         perm_bar = self.query_one("#permission-bar", PermissionBar)
         perm_bar.show_request(request)
-        return await perm_bar.wait_for_response()
+        decision = await perm_bar.wait_for_response()
+        return decision
 
     def action_toggle_plan(self) -> None:
         """Toggle plan mode."""

@@ -184,11 +184,23 @@ async def execute_task(
     from gangge.layer3_agent.tools.file_ops import ReadFileTool, WriteFileTool, EditFileTool
     from gangge.layer3_agent.tools.search import GrepTool, GlobTool, ListDirTool
     from gangge.layer3_agent.tools.web import WebFetchTool
+    from gangge.layer3_agent.tools.ask_user import AskUserTool
+
+    async def _ask_user_callback(question: str) -> str:
+        console.print(f"\n[yellow]❓ {question}[/yellow]")
+        try:
+            answer = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        return answer
 
     registry = ToolRegistry()
     for cls in [BashTool, ReadFileTool, WriteFileTool, EditFileTool,
                  GrepTool, GlobTool, ListDirTool, WebFetchTool]:
         registry.register(cls(workspace=workspace) if cls in (BashTool, ReadFileTool, WriteFileTool, EditFileTool) else cls())
+    from gangge.layer3_agent.tools.lint_check import LintCheckTool
+    registry.register(LintCheckTool(workspace=workspace))
+    registry.register(AskUserTool(ask_callback=_ask_user_callback))
 
     # ── Config ──
     config = LoopConfig(
@@ -196,6 +208,7 @@ async def execute_task(
         workspace_dir=workspace,
         project_context=project_context,
         system_prompt=build_system_prompt(workspace_dir=workspace, project_context=project_context),
+        ask_user_callback=_ask_user_callback,
     )
     if system_prompt_extra:
         config.system_prompt += f"\n\n{system_prompt_extra}"

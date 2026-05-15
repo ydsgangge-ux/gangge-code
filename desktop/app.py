@@ -93,6 +93,7 @@ from gangge.layer5_llm.base import (
 )
 from gangge.layer5_llm.registry import create_llm
 from gangge.layer4_permission.guard import PermissionDecision, PermissionGuard, PermissionRequest
+from gangge.i18n import get_language, set_language, t as _t
 
 # ── LLM Provider definitions ─────────────────────────────────────
 PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
@@ -126,7 +127,7 @@ PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
         "base_url_default": "",
     },
     "ollama": {
-        "label": "Ollama (本地)",
+        "label": _t("ollama_label"),
         "api_key_env": "OLLAMA_API_KEY",
         "model_default": "llama3.1",
         "models": ["llama3.1", "llama3", "mistral", "qwen2.5", "codellama", "deepseek-coder"],
@@ -254,7 +255,7 @@ class SessionDB:
         c.executescript("""
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
-                title TEXT NOT NULL DEFAULT '新会话',
+                title TEXT NOT NULL DEFAULT 'New Session',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 workspace TEXT DEFAULT '',
@@ -309,7 +310,9 @@ class SessionDB:
         except Exception:
             pass
 
-    def create_session(self, title: str = "新会话", workspace: str = "") -> str:
+    def create_session(self, title: str = "", workspace: str = "") -> str:
+        if not title:
+            title = _t("session_new")
         sid = uuid.uuid4().hex[:8]
         now = datetime.now().isoformat()
         self._conn.execute(
@@ -516,7 +519,7 @@ class PlanConfirmDialog(QDialog):
 
     def __init__(self, plan_text: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("📋 确认执行计划")
+        self.setWindowTitle(_t("plan_title"))
         self.setMinimumSize(600, 400)
         self.approved = False
         self._setup_ui(plan_text)
@@ -524,7 +527,7 @@ class PlanConfirmDialog(QDialog):
     def _setup_ui(self, plan_text: str):
         layout = QVBoxLayout(self)
 
-        title = QLabel("📋 LLM 生成的执行计划")
+        title = QLabel(_t("plan_heading"))
         title.setProperty("heading", True)
         layout.addWidget(title)
 
@@ -533,24 +536,24 @@ class PlanConfirmDialog(QDialog):
         self._plan_view.setStyleSheet("background: #161b22; padding: 12px; font-family: Consolas, monospace;")
         layout.addWidget(self._plan_view, 1)
 
-        info = QLabel("请检查计划，确认后 LLM 将按此计划执行。如需调整，可修改上方文本。")
+        info = QLabel(_t("plan_info"))
         info.setWordWrap(True)
         info.setStyleSheet("color: #8b949e; padding: 4px 0;")
         layout.addWidget(info)
 
         btn_row = QHBoxLayout()
-        self._edit_btn = QPushButton("✏️ 编辑计划")
+        self._edit_btn = QPushButton("✏️")
         self._edit_btn.clicked.connect(self._toggle_edit)
         btn_row.addWidget(self._edit_btn)
 
         btn_row.addStretch()
 
-        reject_btn = QPushButton("❌ 拒绝")
+        reject_btn = QPushButton("❌")
         reject_btn.setProperty("danger", True)
         reject_btn.clicked.connect(self.reject)
         btn_row.addWidget(reject_btn)
 
-        approve_btn = QPushButton("✅ 批准执行")
+        approve_btn = QPushButton(_t("btn_approve"))
         approve_btn.setProperty("primary", True)
         approve_btn.clicked.connect(self.approve)
         btn_row.addWidget(approve_btn)
@@ -560,7 +563,7 @@ class PlanConfirmDialog(QDialog):
     def _toggle_edit(self):
         if self._plan_view.isReadOnly():
             self._plan_view.setReadOnly(False)
-            self._edit_btn.setText("💾 保存修改")
+            self._edit_btn.setText(_t("btn_save_edit"))
         else:
             self._plan_view.setReadOnly(True)
             self._edit_btn.setText("✏️ 编辑计划")
@@ -580,26 +583,79 @@ class PlanConfirmDialog(QDialog):
 # ═════════════════════════════════════════════════════════════════
 #  Diff Viewer Widget
 # ═════════════════════════════════════════════════════════════════
-class DiffViewer(QTextBrowser):
-    """Displays unified diffs with green/red highlighting."""
+class DiffViewer(QWidget):
+    """Displays unified diffs with green/red highlighting and rollback action."""
+
+    rollback_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setReadOnly(True)
-        self.setStyleSheet("font-family: 'Consolas','Courier New',monospace; font-size: 12px; background: #0d1117;")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self._text = QTextBrowser()
+        self._text.setReadOnly(True)
+        self._text.setStyleSheet(
+            "QTextBrowser{font-family:'Consolas','Courier New',monospace;font-size:12px;"
+            "background:#0d1117;border:1px solid #21262d;border-radius:4px;color:#c9d1d9;}"
+        )
+        layout.addWidget(self._text)
+
+        self._action_bar = QHBoxLayout()
+        self._action_bar.setContentsMargins(4, 0, 4, 0)
+
+        self._stats_label = QLabel("")
+        self._stats_label.setStyleSheet("color:#8b949e;font-size:11px;")
+        self._action_bar.addWidget(self._stats_label)
+        self._action_bar.addStretch()
+
+        self._rollback_btn = QPushButton("↩️ 回滚此变更")
+        self._rollback_btn.setStyleSheet(
+            "QPushButton{background:#da3633;border:1px solid #f85149;border-radius:4px;"
+            "color:#fff;font-size:11px;padding:3px 10px;font-weight:bold;}"
+            "QPushButton:hover{background:#f85149;}"
+        )
+        self._rollback_btn.clicked.connect(self.rollback_requested.emit)
+        self._rollback_btn.setVisible(False)
+        self._action_bar.addWidget(self._rollback_btn)
+
+        self._copy_btn = QPushButton("📋 复制")
+        self._copy_btn.setStyleSheet(
+            "QPushButton{background:#21262d;border:1px solid #30363d;border-radius:4px;"
+            "color:#8b949e;font-size:11px;padding:3px 8px;}"
+            "QPushButton:hover{background:#30363d;color:#c9d1d9;}"
+        )
+        self._copy_btn.clicked.connect(self._copy_diff)
+        self._copy_btn.setVisible(False)
+        self._action_bar.addWidget(self._copy_btn)
+
+        layout.addLayout(self._action_bar)
+
+        self._current_diff = ""
 
     def show_diff(self, diff_text: str):
-        self.clear()
+        self._current_diff = diff_text
+        self._text.clear()
         if not diff_text.strip():
-            self.setPlainText("(无变更)")
+            self._text.setPlainText("(无变更)")
+            self._stats_label.setText("")
+            self._rollback_btn.setVisible(False)
+            self._copy_btn.setVisible(False)
             return
+
+        added = sum(1 for l in diff_text.splitlines() if l.startswith("+") and not l.startswith("+++"))
+        removed = sum(1 for l in diff_text.splitlines() if l.startswith("-") and not l.startswith("---"))
+        self._stats_label.setText(f"+{added} / -{removed} 行变更")
+        self._rollback_btn.setVisible(True)
+        self._copy_btn.setVisible(True)
 
         html = []
         for line in diff_text.splitlines():
             escaped = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            if line.startswith("+"):
+            if line.startswith("+") and not line.startswith("+++"):
                 html.append(f'<span style="background:#1b3a1b;color:#3fb950">{escaped}</span>')
-            elif line.startswith("-"):
+            elif line.startswith("-") and not line.startswith("---"):
                 html.append(f'<span style="background:#3a1b1b;color:#f85149">{escaped}</span>')
             elif line.startswith("@@"):
                 html.append(f'<span style="color:#58a6ff;font-weight:bold">{escaped}</span>')
@@ -607,7 +663,19 @@ class DiffViewer(QTextBrowser):
                 html.append(f'<span style="color:#d29922;font-weight:bold">{escaped}</span>')
             else:
                 html.append(f'<span style="color:#8b949e">{escaped}</span>')
-        self.setHtml("<pre>" + "<br>".join(html) + "</pre>")
+        self._text.setHtml("<pre style='margin:4px;line-height:1.4;'>" + "<br>".join(html) + "</pre>")
+
+    def set_plain_text(self, text: str):
+        self._current_diff = ""
+        self._text.setPlainText(text)
+        self._stats_label.setText("")
+        self._rollback_btn.setVisible(False)
+        self._copy_btn.setVisible(False)
+
+    def _copy_diff(self):
+        if self._current_diff:
+            from PyQt6.QtWidgets import QApplication
+            QApplication.clipboard().setText(self._current_diff)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -623,6 +691,7 @@ class GanggeWorker(QThread):
     plan_ready = pyqtSignal(str)            # plan text for confirmation
     # ── CHANGE: 方案C — 每轮聚合消息信号 ──
     turn_complete = pyqtSignal(list)        # list[dict] 聚合后的消息列表
+    ask_user_sig = pyqtSignal(str)          # question to ask user
 
     def __init__(self, llm: BaseLLM, task: str, workspace: str,
                  max_rounds: int = 30, plan_mode: bool = False,
@@ -658,6 +727,8 @@ class GanggeWorker(QThread):
         self._model = model_name or getattr(llm, "model", "")
         self._cancel = False
         self._approved_plan = ""
+        self._ask_user_answer = ""
+        self._ask_user_event = asyncio.Event()
 
     def cancel(self):
         self._cancel = True
@@ -722,7 +793,7 @@ class GanggeWorker(QThread):
             asyncio.run(self._run_async())
         except Exception as e:
             import traceback
-            self.text_block.emit(f"❌ 执行异常: {e}\n{traceback.format_exc()}", "error")
+            self.text_block.emit(_t("execution_error", error=f"{e}\n{traceback.format_exc()}"), "error")
             self.finished.emit({"error": str(e)})
 
     async def _run_async(self):
@@ -739,15 +810,26 @@ class GanggeWorker(QThread):
         from gangge.layer3_agent.tools.file_ops import ReadFileTool, WriteFileTool, EditFileTool
         from gangge.layer3_agent.tools.search import GrepTool, GlobTool, ListDirTool
         from gangge.layer3_agent.tools.web import WebFetchTool
+        from gangge.layer3_agent.tools.ask_user import AskUserTool
+        from gangge.layer3_agent.tools.lint_check import LintCheckTool
 
         registry = ToolRegistry()
-        # BashTool gets workspace lock so commands run in project dir
         registry.register(BashTool(workspace=self.workspace))
         registry.register(ReadFileTool(workspace=self.workspace))
         registry.register(WriteFileTool(workspace=self.workspace))
         registry.register(EditFileTool(workspace=self.workspace))
+        registry.register(LintCheckTool(workspace=self.workspace))
         for cls in [GrepTool, GlobTool, ListDirTool, WebFetchTool]:
             registry.register(cls())
+
+        async def _ask_user_callback(question: str) -> str:
+            self._ask_user_answer = ""
+            self._ask_user_event.clear()
+            self.ask_user_sig.emit(question)
+            await self._ask_user_event.wait()
+            return self._ask_user_answer
+
+        registry.register(AskUserTool(ask_callback=_ask_user_callback))
 
         extra = self.system_prompt_extra
         system_text = build_system_prompt(
@@ -760,16 +842,7 @@ class GanggeWorker(QThread):
 
         # If plan_mode is on, inject a clear instruction to first generate a plan
         if self.plan_mode:
-            system_text += (
-                "\n\n## 当前模式: 先计划后执行\n"
-                "请先输出一个清晰的执行计划，包含步骤、涉及文件、风险。\n"
-                "输出格式:\n"
-                "### Plan\n"
-                "1. [步骤描述] — 文件: xxx\n"
-                "2. [步骤描述] — 文件: xxx\n"
-                "...\n"
-                "输出完计划后等待用户确认，不要自动执行。\n"
-            )
+            system_text += _t("plan_mode_prompt")
 
         config = LoopConfig(
             max_tool_rounds=self.max_rounds,
@@ -781,6 +854,7 @@ class GanggeWorker(QThread):
             memory_bank_progress=self.memory_bank_progress,
             memory_bank_changelog=self.memory_bank_changelog,
             ganggerules=self.ganggerules,
+            ask_user_callback=_ask_user_callback,
         )
 
         # ── 3. Create loop ──
@@ -796,7 +870,7 @@ class GanggeWorker(QThread):
                 self.text_block.emit(f"🤔 {block.text}", "system")
             elif block.type == ContentType.TOOL_USE:
                 inp = json.dumps(block.tool_input, ensure_ascii=False)[:200]
-                self.text_block.emit(f"\n🔧 调用工具: {block.tool_name}({inp})\n", "tool")
+                self.text_block.emit(_t("execution_tool_call", name=block.tool_name, input=inp), "tool")
 
         loop.set_stream_callback(stream_cb)
 
@@ -810,7 +884,7 @@ class GanggeWorker(QThread):
         self.text_block.emit(f"\n📋 任务: {full_task}\n", "user")
         if self.batch_total > 1:
             self.text_block.emit(f"📌 批处理进度: {self.batch_index + 1}/{self.batch_total}\n", "system")
-        self.text_block.emit(f"📁 工作目录: {self.workspace}\n", "system")
+        self.text_block.emit(_t("execution_workspace", path=self.workspace), "system")
         self.text_block.emit("─" * 60 + "\n", "system")
 
         # If there's a pre-approved plan, inject it after the first LLM response
@@ -846,6 +920,8 @@ class GanggeWorker(QThread):
             "final_response": result.final_response,
             "memory_bank_update": mb_update,
             "cost": cost_display,
+            "shadow_checkpoint_before": result.extra.get("shadow_checkpoint_before", ""),
+            "shadow_checkpoint_after": result.extra.get("shadow_checkpoint_after", ""),
         }
 
         for exc in result.tool_executions:
@@ -856,8 +932,7 @@ class GanggeWorker(QThread):
         out = result.total_tokens.get("output", 0)
         cost_part = f" | 费用: {cost_display}" if cost_display else ""
         self.text_block.emit(
-            f"\n✅ 完成 ({result.total_rounds} 轮, {len(result.tool_executions)} 次工具调用, "
-            f"Token: 输入={inp}, 输出={out}{cost_part})\n",
+            _t("execution_done", rounds=result.total_rounds, tools=len(result.tool_executions), input=inp, output=out, cost=cost_part),
             "system",
         )
         if result.final_response:
@@ -872,6 +947,27 @@ class GanggeWorker(QThread):
 class FileBrowserWidget(QWidget):
     file_selected = pyqtSignal(str)
 
+    FILE_ICONS = {
+        ".py": "🐍", ".js": "📜", ".ts": "📘", ".jsx": "⚛️", ".tsx": "⚛️",
+        ".html": "🌐", ".css": "🎨", ".scss": "🎨", ".sass": "🎨",
+        ".json": "📋", ".yaml": "⚙️", ".yml": "⚙️", ".toml": "⚙️",
+        ".md": "📝", ".rst": "📝", ".txt": "📄",
+        ".sql": "🗄️", ".db": "🗄️", ".sqlite": "🗄️",
+        ".sh": "💻", ".bat": "💻", ".ps1": "💻",
+        ".dockerfile": "🐳", ".env": "🔐", ".gitignore": "🔀",
+        ".cpp": "🔧", ".c": "🔧", ".h": "🔧", ".hpp": "🔧",
+        ".rs": "🦀", ".go": "🐹", ".java": "☕", ".kt": "📱",
+        ".rb": "💎", ".php": "🐘", ".swift": "🦅",
+        ".png": "🖼️", ".jpg": "🖼️", ".jpeg": "🖼️", ".gif": "🖼️", ".svg": "🖼️",
+        ".mp4": "🎬", ".mp3": "🎵", ".wav": "🎵",
+        ".zip": "📦", ".tar": "📦", ".gz": "📦", ".rar": "📦",
+        ".pdf": "📑", ".doc": "📑", ".docx": "📑",
+        ".xml": "📰", ".csv": "📊", ".xlsx": "📊",
+    }
+    FOLDER_ICON = "📁"
+    FOLDER_OPEN_ICON = "📂"
+    DEFAULT_FILE_ICON = "📄"
+
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
@@ -879,18 +975,32 @@ class FileBrowserWidget(QWidget):
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(True)
         self._tree.setAnimated(True)
-        self._tree.setIndentation(18)
+        self._tree.setIndentation(16)
         self._tree.itemExpanded.connect(self._on_expand)
+        self._tree.itemCollapsed.connect(self._on_collapse)
         self._tree.itemClicked.connect(self._on_click)
+        self._tree.setStyleSheet(
+            "QTreeWidget{background:#0d1117;border:1px solid #21262d;border-radius:6px;"
+            "color:#c9d1d9;outline:none;}"
+            "QTreeWidget::item{padding:3px 4px;border-radius:3px;}"
+            "QTreeWidget::item:selected{background:#1f6feb;color:#fff;}"
+            "QTreeWidget::item:hover{background:#161b22;}"
+        )
         layout.addWidget(self._tree)
         self._root_path = ""
+
+    def _get_icon(self, entry: Path) -> str:
+        if entry.is_dir():
+            return self.FOLDER_ICON
+        ext = entry.suffix.lower()
+        return self.FILE_ICONS.get(ext, self.DEFAULT_FILE_ICON)
 
     def set_root(self, path: str):
         self._root_path = path
         self._tree.clear()
         if not path or not os.path.isdir(path):
             return
-        root_item = QTreeWidgetItem([os.path.basename(path) or path])
+        root_item = QTreeWidgetItem([f"{self.FOLDER_OPEN_ICON} {os.path.basename(path) or path}"])
         root_item.setData(0, Qt.ItemDataRole.UserRole, path)
         f = root_item.font(0)
         f.setBold(True)
@@ -912,7 +1022,8 @@ class FileBrowserWidget(QWidget):
                 continue
             if entry.name in hidden:
                 continue
-            child = QTreeWidgetItem([entry.name])
+            icon = self._get_icon(entry)
+            child = QTreeWidgetItem([f"{icon} {entry.name}"])
             child.setData(0, Qt.ItemDataRole.UserRole, str(entry))
             if entry.is_dir():
                 child.setChildIndicatorPolicy(QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
@@ -920,6 +1031,9 @@ class FileBrowserWidget(QWidget):
             parent_item.addChild(child)
 
     def _on_expand(self, item):
+        text = item.text(0)
+        if self.FOLDER_ICON in text and self.FOLDER_OPEN_ICON not in text:
+            item.setText(0, text.replace(self.FOLDER_ICON, self.FOLDER_OPEN_ICON, 1))
         path = item.data(0, Qt.ItemDataRole.UserRole) or ""
         if not path or not os.path.isdir(path):
             return
@@ -927,6 +1041,11 @@ class FileBrowserWidget(QWidget):
             item.removeChild(item.child(0))
         if item.childCount() == 0:
             self._populate(item, path, self._depth(item))
+
+    def _on_collapse(self, item):
+        text = item.text(0)
+        if self.FOLDER_OPEN_ICON in text:
+            item.setText(0, text.replace(self.FOLDER_OPEN_ICON, self.FOLDER_ICON, 1))
 
     def _depth(self, item):
         d = 0
@@ -942,70 +1061,204 @@ class FileBrowserWidget(QWidget):
 
 
 # ═════════════════════════════════════════════════════════════════
-#  Tool Call Table + Diff Tab
+#  Tool Call Table + Inline Diff Viewer
 # ═════════════════════════════════════════════════════════════════
-class DiffTabWidget(QWidget):
-    """Combined tool call table + diff viewer."""
+class ToolCallPanel(QWidget):
+    """Tool call table with inline diff viewer — saves vertical space."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        # Header with count
+        header = QHBoxLayout()
+        self._count_label = QLabel(_t("tool_calls", n=0))
+        self._count_label.setProperty("heading", True)
+        header.addWidget(self._count_label)
+        header.addStretch()
+        clear_btn = QPushButton(_t("btn_clear"))
+        clear_btn.setStyleSheet(
+            "QPushButton{background:#21262d;border:1px solid #30363d;border-radius:4px;"
+            "color:#8b949e;font-size:11px;padding:2px 8px;}"
+            "QPushButton:hover{background:#30363d;color:#c9d1d9;}"
+        )
+        clear_btn.clicked.connect(self.clear_entries)
+        header.addWidget(clear_btn)
+        layout.addLayout(header)
 
         # Table
-        self._table = QTableWidget(0, 4)
-        self._table.setHorizontalHeaderLabels(["#", "工具", "状态", "输出"])
-        self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setColumnWidth(0, 40)
-        self._table.setColumnWidth(1, 100)
-        self._table.setColumnWidth(2, 60)
+        self._table = QTableWidget(0, 5)
+        self._table.setHorizontalHeaderLabels([_t("tool_header_num"), _t("tool_header_name"), _t("tool_header_status"), _t("tool_header_output"), ""])
+        self._table.horizontalHeader().setStretchLastSection(False)
+        self._table.setColumnWidth(0, 36)
+        self._table.setColumnWidth(1, 90)
+        self._table.setColumnWidth(2, 50)
+        self._table.setColumnWidth(4, 40)
+        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self._table.setAlternatingRowColors(True)
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self._table.itemSelectionChanged.connect(self._on_selection_changed)
+        self._table.setStyleSheet(
+            "QTableWidget{background-color:#0d1117;border:1px solid #21262d;border-radius:6px;"
+            "gridline-color:#161b22;color:#c9d1d9;}"
+            "QTableWidget::item{padding:4px 6px;font-size:12px;}"
+            "QTableWidget::item:selected{background:#1f6feb;}"
+        )
+        self._table.cellClicked.connect(self._on_cell_clicked)
         layout.addWidget(self._table)
 
-        # Diff viewer
-        diff_label = QLabel("📝 文件变更 (Diff)")
-        diff_label.setProperty("heading", True)
-        layout.addWidget(diff_label)
+        # Inline diff viewer (hidden by default)
+        self._diff_frame = QFrame()
+        self._diff_frame.setStyleSheet(
+            "QFrame{background:#0d1117;border:1px solid #30363d;border-radius:6px;}"
+        )
+        diff_layout = QVBoxLayout(self._diff_frame)
+        diff_layout.setContentsMargins(8, 6, 8, 6)
+        diff_layout.setSpacing(4)
+
+        diff_header = QHBoxLayout()
+        diff_title = QLabel("📝 文件变更")
+        diff_title.setStyleSheet("color:#58a6ff;font-size:12px;font-weight:bold;")
+        diff_header.addWidget(diff_title)
+        diff_header.addStretch()
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(22, 22)
+        close_btn.setStyleSheet(
+            "QPushButton{background:transparent;color:#8b949e;font-size:12px;border:none;}"
+            "QPushButton:hover{color:#f85149;}"
+        )
+        close_btn.clicked.connect(lambda: self._diff_frame.setVisible(False))
+        diff_header.addWidget(close_btn)
+        diff_layout.addLayout(diff_header)
 
         self._diff_viewer = DiffViewer()
-        self._diff_viewer.setMinimumHeight(150)
-        layout.addWidget(self._diff_viewer)
+        self._diff_viewer.setMinimumHeight(120)
+        self._diff_viewer.setMaximumHeight(300)
+        self._diff_viewer.rollback_requested.connect(self._on_rollback_diff)
+        diff_layout.addWidget(self._diff_viewer)
+        self._diff_frame.setVisible(False)
+        layout.addWidget(self._diff_frame)
 
-        self._diffs: list[str] = []
+        self._entries: list[dict] = []
+        self._expanded_row: int = -1
 
     def add_entry(self, tool_name: str, output: str, is_error: bool, diff: str = ""):
         row = self._table.rowCount()
         self._table.insertRow(row)
-        self._table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
-        self._table.setItem(row, 1, QTableWidgetItem(tool_name))
-        s = QTableWidgetItem("❌" if is_error else "✅")
-        s.setForeground(QColor("#f85149" if is_error else "#3fb950"))
-        self._table.setItem(row, 2, s)
-        o = QTableWidgetItem(output[:200])
-        o.setToolTip(output)
-        self._table.setItem(row, 3, o)
-        self._diffs.append(diff)
+
+        # Row height
+        self._table.setRowHeight(row, 28)
+
+        # #
+        num = QTableWidgetItem(str(row + 1))
+        num.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        num.setForeground(QColor("#484f58"))
+        self._table.setItem(row, 0, num)
+
+        # Tool name with icon
+        icon_map = {
+            "write_file": "📝", "edit_file": "✏️", "read_file": "📄",
+            "bash": "💻", "grep": "🔍", "glob": "📂", "list_dir": "📁",
+            "web_fetch": "🌐", "ask_user": "❓", "lint_check": "🔍",
+        }
+        icon = icon_map.get(tool_name, "🔧")
+        tool_item = QTableWidgetItem(f"{icon} {tool_name}")
+        tool_item.setForeground(QColor("#d29922"))
+        self._table.setItem(row, 1, tool_item)
+
+        # Status
+        status_text = "❌" if is_error else "✅"
+        status_item = QTableWidgetItem(status_text)
+        status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        status_item.setForeground(QColor("#f85149" if is_error else "#3fb950"))
+        self._table.setItem(row, 2, status_item)
+
+        # Output (truncated)
+        out_text = output[:120].replace("\n", " ")
+        out_item = QTableWidgetItem(out_text)
+        out_item.setToolTip(output[:500])
+        out_item.setForeground(QColor("#8b949e"))
+        self._table.setItem(row, 3, out_item)
+
+        # Diff indicator
+        has_diff = bool(diff and diff.strip())
+        diff_btn = QTableWidgetItem("📋" if has_diff else "")
+        diff_btn.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        diff_btn.setToolTip(_t("tip_diff") if has_diff else _t("tip_no_diff"))
+        diff_btn.setForeground(QColor("#58a6ff" if has_diff else "#30363d"))
+        self._table.setItem(row, 4, diff_btn)
+
+        self._entries.append({
+            "tool_name": tool_name,
+            "output": output,
+            "is_error": is_error,
+            "diff": diff,
+            "has_diff": has_diff,
+        })
+        self._count_label.setText(_t("tool_calls", n=len(self._entries)))
         self._table.scrollToBottom()
 
-    def _on_selection_changed(self):
-        rows = self._table.selectionModel().selectedRows()
-        if rows:
-            idx = rows[0].row()
-            if 0 <= idx < len(self._diffs):
-                self._diff_viewer.show_diff(self._diffs[idx])
+    def _on_cell_clicked(self, row: int, col: int):
+        if row < 0 or row >= len(self._entries):
+            return
+        entry = self._entries[row]
+
+        # Click diff column or any row to toggle diff
+        if col == 4 or entry.get("has_diff"):
+            if self._expanded_row == row and self._diff_frame.isVisible():
+                self._diff_frame.setVisible(False)
+                self._expanded_row = -1
             else:
-                self._diff_viewer.clear()
+                self._diff_viewer.show_diff(entry.get("diff", ""))
+                self._diff_frame.setVisible(True)
+                self._expanded_row = row
         else:
-            self._diff_viewer.clear()
+            # Show output in diff viewer for non-diff entries
+            self._diff_viewer.set_plain_text(entry.get("output", "") or "(无输出)")
+            self._diff_frame.setVisible(True)
+            self._expanded_row = row
 
     def clear_entries(self):
         self._table.setRowCount(0)
-        self._diffs.clear()
-        self._diff_viewer.clear()
+        self._entries.clear()
+        self._diff_frame.setVisible(False)
+        self._expanded_row = -1
+        self._count_label.setText(_t("tool_calls", n=0))
+
+    def _on_rollback_diff(self):
+        from PyQt6.QtWidgets import QMessageBox
+        window = self.window()
+        workspace = ""
+        if hasattr(window, "_ws_input"):
+            workspace = window._ws_input.text().strip()
+        if not workspace:
+            return
+        from gangge.layer4_tools.shadow_git import ShadowGit
+        sg = ShadowGit(workspace)
+        if not sg.is_available():
+            return
+        reply = QMessageBox.warning(
+            window, _t("rollback_confirm"),
+            _t("rollback_done_simple"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        if sg.rollback("HEAD~1"):
+            if hasattr(window, "_append_output"):
+                window._append_output(_t("rollback_done_simple"), "system")
+            if hasattr(window, "_file_browser"):
+                window._file_browser.set_root(workspace)
+            if hasattr(window, "_status_label"):
+                window._status_label.setText(_t("status_rollback_ok"))
+            self._diff_frame.setVisible(False)
+        else:
+            if hasattr(window, "_status_label"):
+                window._status_label.setText(_t("status_rollback_fail"))
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -1304,7 +1557,7 @@ def update_memory_bank(workspace: str, progress_update: str, changelog_update: s
 class GanggeDesktop(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Gangge Code — AI 编程助手")
+        self.setWindowTitle(f"{_t('app_title')} — {_t('app_subtitle')}")
         self.setMinimumSize(1200, 800)
         self.resize(1500, 920)
 
@@ -1326,47 +1579,67 @@ class GanggeDesktop(QMainWindow):
         self._refresh_session_list()
         self._update_provider_fields()
 
-        # Status bar
+        # Status bar — multi-section with real-time stats
         sb = QStatusBar()
         self.setStatusBar(sb)
-        self._status_label = QLabel("就绪")
+        sb.setStyleSheet("QStatusBar{background:#161b22;border-top:1px solid #21262d;padding:2px 8px;}")
+
+        # Left: main status message
+        self._status_label = QLabel(_t("status_ready"))
+        self._status_label.setStyleSheet("color:#c9d1d9;font-size:12px;padding:2px 8px;")
         sb.addWidget(self._status_label, 1)
+
+        # Center: live stats (rounds, tokens)
+        self._stats_label = QLabel("")
+        self._stats_label.setStyleSheet("color:#8b949e;font-size:11px;padding:2px 8px;")
+        sb.addPermanentWidget(self._stats_label)
+
+        # Right: progress bar
         self._status_progress = QProgressBar()
-        self._status_progress.setMaximumWidth(200)
+        self._status_progress.setMaximumWidth(120)
+        self._status_progress.setMaximumHeight(14)
+        self._status_progress.setStyleSheet(
+            "QProgressBar{background:#21262d;border:1px solid #30363d;border-radius:6px;"
+            "text-align:center;color:#8b949e;font-size:10px;height:14px;}"
+            "QProgressBar::chunk{background:#1f6feb;border-radius:5px;}"
+        )
         self._status_progress.setVisible(False)
         sb.addPermanentWidget(self._status_progress)
+
+        # Far right: timer
+        self._timer_label = QLabel("")
+        self._timer_label.setStyleSheet("color:#484f58;font-size:11px;padding:2px 4px;")
+        sb.addPermanentWidget(self._timer_label)
 
     # ── Menu ──────────────────────────────────────────────────
     def _setup_menu(self):
         mb = self.menuBar()
-        fm = mb.addMenu("文件(&F)")
-        a = QAction("新建会话", self)
+        fm = mb.addMenu(_t("menu_file"))
+        a = QAction(_t("menu_new_session"), self)
         a.setShortcut(QKeySequence("Ctrl+N"))
         a.triggered.connect(self._new_session)
         fm.addAction(a)
         fm.addSeparator()
-        a = QAction("清空输出", self)
+        a = QAction(_t("menu_clear_output"), self)
         a.setShortcut(QKeySequence("Ctrl+L"))
         a.triggered.connect(self._clear_output)
         fm.addAction(a)
         fm.addSeparator()
-        a = QAction("退出(&Q)", self)
+        a = QAction(_t("menu_quit"), self)
         a.setShortcut(QKeySequence("Ctrl+Q"))
         a.triggered.connect(self.close)
         fm.addAction(a)
 
-        tm = mb.addMenu("工具(&T)")
-        a = QAction("打开工作目录...", self)
+        tm = mb.addMenu(_t("menu_tools"))
+        a = QAction(_t("menu_open_workspace"), self)
         a.setShortcut(QKeySequence("Ctrl+O"))
         a.triggered.connect(self._browse_workspace)
         tm.addAction(a)
 
-        hm = mb.addMenu("帮助(&H)")
-        a = QAction("关于 Gangge Code", self)
+        hm = mb.addMenu(_t("menu_help"))
+        a = QAction(_t("menu_about"), self)
         a.triggered.connect(lambda: QMessageBox.about(
-            self, "关于", "<h2>Gangge Code v0.1.0</h2><p>AI 编程助手 — 5 层架构 Agentic Loop</p>"
-            "<p>支持: DeepSeek · OpenAI · Anthropic · Ollama</p>"
-            "<hr><p>会话持久化 · 文件 Diff · 测试验证 · 批量任务 · 计划确认</p>"))
+            self, _t("menu_about"), _t("about_text")))
         hm.addAction(a)
 
     # ── Config widgets (created early, displayed in settings dialog) ──
@@ -1391,27 +1664,32 @@ class GanggeDesktop(QMainWindow):
         self._max_rounds_spin.setValue(30)
         self._max_rounds_spin.hide()
 
-        self._auto_allow_cb = QCheckBox("自动允许安全操作", self)
+        self._auto_allow_cb = QCheckBox(_t("cb_auto_allow"), self)
         self._auto_allow_cb.setChecked(True)
         self._auto_allow_cb.hide()
 
-        self._auto_inject_cb = QCheckBox("自动注入项目上下文", self)
+        self._auto_inject_cb = QCheckBox(_t("cb_auto_inject"), self)
         self._auto_inject_cb.setChecked(True)
         self._auto_inject_cb.hide()
 
-        self._test_verify_cb = QCheckBox("自动触发测试验证", self)
+        self._test_verify_cb = QCheckBox(_t("cb_test_verify"), self)
         self._test_verify_cb.setChecked(True)
         self._test_verify_cb.hide()
 
-        self._git_commit_cb = QCheckBox("任务完成后自动 Git 提交", self)
+        self._git_commit_cb = QCheckBox(_t("cb_git_commit"), self)
         self._git_commit_cb.setChecked(True)
         self._git_commit_cb.hide()
 
-        self._plan_mode_cb = QCheckBox("规划模式 (先出计划后执行)", self)
+        self._lang_combo = QComboBox(self)
+        self._lang_combo.addItem("中文", "zh")
+        self._lang_combo.addItem("English", "en")
+        self._lang_combo.hide()
+
+        self._plan_mode_cb = QCheckBox(_t("cb_plan_mode"), self)
         self._plan_mode_cb.hide()
 
         self._extra_prompt = QPlainTextEdit(self)
-        self._extra_prompt.setPlaceholderText("额外的指令...")
+        self._extra_prompt.setPlaceholderText(_t("extra_prompt_placeholder"))
         self._extra_prompt.setMaximumHeight(100)
         self._extra_prompt.hide()
 
@@ -1446,14 +1724,17 @@ class GanggeDesktop(QMainWindow):
             )
             return b
 
-        tb.addWidget(_tb_btn("🔄 新建", "新建会话 (Ctrl+N)", self._new_session))
-        self._btn_cancel = _tb_btn("⏹ 停止", "停止执行", self._cancel_task)
+        tb.addWidget(_tb_btn(_t("btn_new"), _t("tip_new"), self._new_session))
+        self._btn_cancel = _tb_btn(_t("btn_stop"), _t("tip_stop"), self._cancel_task)
         self._btn_cancel.setEnabled(False)
         tb.addWidget(self._btn_cancel)
-        tb.addWidget(_tb_btn("🗑 清空", "清空输出 (Ctrl+L)", self._clear_output))
+        tb.addWidget(_tb_btn(_t("btn_clear"), _t("tip_clear"), self._clear_output))
         tb.addSeparator()
-        tb.addWidget(_tb_btn("📂 目录", "选择工作目录 (Ctrl+O)", self._browse_workspace))
-        tb.addWidget(_tb_btn("💾 导出", "保存输出到文件", self._save_output))
+        tb.addWidget(_tb_btn(_t("btn_dir"), _t("tip_dir"), self._browse_workspace))
+        tb.addWidget(_tb_btn(_t("btn_export"), _t("tip_export"), self._save_output))
+        self._btn_rollback = _tb_btn(_t("btn_rollback"), _t("tip_rollback"), self._rollback_checkpoint)
+        self._btn_rollback.setEnabled(False)
+        tb.addWidget(self._btn_rollback)
         tb.addSeparator()
 
         sp = QWidget()
@@ -1471,9 +1752,9 @@ class GanggeDesktop(QMainWindow):
         tb.addWidget(self._provider_combo)
 
         tb.addSeparator()
-        tb.addWidget(_tb_btn("⚙ 设置", "打开设置", self._open_settings))
+        tb.addWidget(_tb_btn(_t("btn_settings"), _t("tip_settings"), self._open_settings))
 
-        # ── Main splitter: Sidebar | Center ──
+        # ── Main splitter: Sidebar | Center | Preview ──
         main_sp = QSplitter(Qt.Orientation.Horizontal)
         main_sp.setHandleWidth(2)
 
@@ -1509,9 +1790,9 @@ class GanggeDesktop(QMainWindow):
         sess_lay.addWidget(self._session_list)
         sess_btn_row = QHBoxLayout()
         for text, tip, cb in [
-            ("➕", "新建会话", lambda: self._new_session()),
-            ("✏️", "重命名", lambda: self._rename_session()),
-            ("🗑️", "删除", lambda: self._delete_session()),
+            ("➕", _t("sidebar_new"), lambda: self._new_session()),
+            ("✏️", _t("sidebar_rename"), lambda: self._rename_session()),
+            ("🗑️", _t("sidebar_delete"), lambda: self._delete_session()),
         ]:
             b = QPushButton(text)
             b.setFixedSize(28, 24)
@@ -1525,7 +1806,7 @@ class GanggeDesktop(QMainWindow):
             sess_btn_row.addWidget(b)
         sess_btn_row.addStretch()
         sess_lay.addLayout(sess_btn_row)
-        sidebar_tabs.addTab(sess_tab, "📋 会话")
+        sidebar_tabs.addTab(sess_tab, _t("tab_sessions"))
 
         # ── Files tab ──
         files_tab = QWidget()
@@ -1534,12 +1815,12 @@ class GanggeDesktop(QMainWindow):
         fl.setSpacing(4)
         ws_row = QHBoxLayout()
         self._ws_input = QLineEdit()
-        self._ws_input.setPlaceholderText("工作目录...")
+        self._ws_input.setPlaceholderText(_t("workspace_placeholder"))
         self._ws_input.setStyleSheet("font-size:11px;padding:4px 8px;")
         ws_row.addWidget(self._ws_input)
         ws_btn = QPushButton("📂")
         ws_btn.setFixedSize(28, 24)
-        ws_btn.setToolTip("选择目录")
+        ws_btn.setToolTip(_t("tip_select_dir"))
         ws_btn.setStyleSheet(
             "QPushButton{background:#21262d;border:1px solid #30363d;border-radius:4px;"
             "color:#c9d1d9;font-size:11px;padding:0;}"
@@ -1552,123 +1833,162 @@ class GanggeDesktop(QMainWindow):
         self._file_browser.setStyleSheet(
             "FileBrowserWidget{background:#0d1117;border:1px solid #21262d;border-radius:4px;color:#c9d1d9;}"
         )
+        self._file_browser.file_selected.connect(self._on_file_selected)
         fl.addWidget(self._file_browser)
         sidebar_tabs.addTab(files_tab, "📂 文件")
 
         sl.addWidget(sidebar_tabs)
 
         # ════════════════════════════════════════
-        #  CENTER AREA — Chat + Bottom Panel
+        #  CENTER AREA — Chat + Input (VSCode-style)
         # ════════════════════════════════════════
         center = QWidget()
         center_lay = QVBoxLayout(center)
-        center_lay.setContentsMargins(8, 4, 8, 4)
-        center_lay.setSpacing(4)
-
-        # Vertical splitter: Chat output (top) | Tool/Diff panel (bottom)
-        v_sp = QSplitter(Qt.Orientation.Vertical)
-        v_sp.setHandleWidth(2)
+        center_lay.setContentsMargins(0, 0, 0, 0)
+        center_lay.setSpacing(0)
 
         # ── Chat output ──
         self._output = QTextBrowser()
         self._output.setReadOnly(True)
         self._output.setOpenExternalLinks(True)
-        self._output.setMinimumHeight(200)
         self._output.setStyleSheet(
-            "QTextBrowser{background:#0d1117;border:1px solid #21262d;border-radius:6px;"
-            "padding:12px;color:#c9d1d9;font-size:13px;}"
+            "QTextBrowser{background:#0d1117;border:none;"
+            "padding:16px 20px;color:#c9d1d9;font-size:13px;}"
         )
         self._highlighter = OutputHighlighter(self._output.document())
-        v_sp.addWidget(self._output)
+        center_lay.addWidget(self._output, 1)
 
-        # ── Bottom panel: Tool/Diff tabs ──
-        bottom_panel = QTabWidget()
-        bottom_panel.setDocumentMode(True)
-        bottom_panel.setMinimumHeight(150)
-        bottom_panel.setMaximumHeight(350)
-        bottom_panel.setStyleSheet(
-            "QTabWidget::pane{border:1px solid #21262d;border-radius:4px;background:#0d1117;}"
-            "QTabBar::tab{background:#161b22;color:#8b949e;border:1px solid #21262d;"
-            "border-bottom:none;padding:4px 14px;font-size:11px;}"
-            "QTabBar::tab:selected{background:#0d1117;color:#f0f6fc;}"
-        )
-
-        # Tools tab
-        self._tool_table = DiffTabWidget()
-        self._tool_table.setStyleSheet("background:#0d1117;")
-        bottom_panel.addTab(self._tool_table, "🔧 工具调用")
-
-        # Diff tab (reuses the same DiffTabWidget's diff viewer)
-        self._diff_tab = DiffTabWidget()
-        bottom_panel.addTab(self._diff_tab, "📝 文件变更")
-
-        v_sp.addWidget(bottom_panel)
-        v_sp.setSizes([400, 200])
-        v_sp.setStretchFactor(0, 3)
-        v_sp.setStretchFactor(1, 1)
-
-        center_lay.addWidget(v_sp)
-
-        # ── Input area ──
+        # ── Input area (compact, VSCode-style bottom bar) ──
         input_frame = QFrame()
         input_frame.setStyleSheet(
-            "QFrame{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:6px;}"
+            "QFrame{background:#161b22;border-top:1px solid #21262d;}"
         )
-        input_lay = QVBoxLayout(input_frame)
-        input_lay.setContentsMargins(8, 6, 8, 6)
-        input_lay.setSpacing(6)
+        input_lay = QHBoxLayout(input_frame)
+        input_lay.setContentsMargins(12, 8, 12, 8)
+        input_lay.setSpacing(8)
 
         self._task_input = QPlainTextEdit()
         self._task_input.setPlaceholderText(
-            "输入编程任务... (Ctrl+Enter 执行)\n"
-            "多行 = 批量任务，每行一个，依次执行"
+            _t("input_placeholder")
         )
-        self._task_input.setMaximumHeight(80)
-        self._task_input.setMinimumHeight(48)
+        self._task_input.setMaximumHeight(100)
+        self._task_input.setMinimumHeight(36)
         self._task_input.setStyleSheet(
-            "QPlainTextEdit{background:#0d1117;border:1px solid #30363d;border-radius:6px;"
-            "padding:8px;color:#c9d1d9;font-size:13px;}"
-            "QPlainTextEdit:focus{border-color:#58a6ff;}"
+            "QPlainTextEdit{background:#0d1117;border:1px solid #30363d;"
+            "border-radius:6px;padding:6px 10px;color:#c9d1d9;font-size:13px;}"
+            "QPlainTextEdit:focus{border:1px solid #58a6ff;outline:none;}"
         )
-        input_lay.addWidget(self._task_input)
+        self._task_input.textChanged.connect(self._auto_resize_input)
+        input_lay.addWidget(self._task_input, 1)
 
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(6)
-        self._batch_btn = QPushButton("📋 批量")
-        self._batch_btn.setToolTip("多行任务依次执行")
+        # Button column: Stop/Run toggle + Batch
+        btn_col = QVBoxLayout()
+        btn_col.setSpacing(4)
+        btn_col.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        self._batch_btn = QPushButton(_t("btn_batch"))
+        self._batch_btn.setToolTip(_t("tip_batch"))
+        self._batch_btn.setFixedHeight(28)
         self._batch_btn.setStyleSheet(
-            "QPushButton{background:#21262d;border:1px solid #30363d;border-radius:6px;"
-            "padding:6px 14px;color:#c9d1d9;font-size:12px;}"
-            "QPushButton:hover{background:#30363d;}"
+            "QPushButton{background:#21262d;border:1px solid #30363d;border-radius:4px;"
+            "color:#8b949e;font-size:11px;padding:2px 8px;}"
+            "QPushButton:hover{background:#30363d;color:#c9d1d9;}"
         )
         self._batch_btn.clicked.connect(self._run_batch)
-        btn_row.addWidget(self._batch_btn)
+        btn_col.addWidget(self._batch_btn)
 
-        btn_row.addStretch()
-
-        self._btn_run = QPushButton("▶  执行")
-        self._btn_run.setProperty("primary", True)
-        self._btn_run.setMinimumWidth(120)
+        self._btn_run = QPushButton(_t("btn_send"))
+        self._btn_run.setToolTip(_t("tip_send"))
+        self._btn_run.setFixedHeight(34)
         self._btn_run.setStyleSheet(
-            "QPushButton{background:#238636;color:#fff;border:1px solid rgba(240,246,252,0.1);"
-            "border-radius:6px;padding:8px 24px;font-size:13px;font-weight:600;}"
+            "QPushButton{background:#238636;color:#fff;border:none;"
+            "border-radius:6px;font-size:13px;font-weight:bold;padding:4px 14px;}"
             "QPushButton:hover{background:#2ea043;}"
             "QPushButton:disabled{background:#21262d;color:#484f58;}"
         )
         self._btn_run.clicked.connect(self._run_task)
-        btn_row.addWidget(self._btn_run)
+        btn_col.addWidget(self._btn_run)
 
-        input_lay.addLayout(btn_row)
-        QShortcut(QKeySequence("Ctrl+Return"), self._task_input, self._run_task)
+        # Stop button (hidden by default, shown during execution)
+        self._btn_stop = QPushButton(_t("btn_stop"))
+        self._btn_stop.setToolTip(_t("tip_stop"))
+        self._btn_stop.setFixedHeight(34)
+        self._btn_stop.setStyleSheet(
+            "QPushButton{background:#da3633;color:#fff;border:none;"
+            "border-radius:6px;font-size:13px;font-weight:bold;padding:4px 14px;}"
+            "QPushButton:hover{background:#f85149;}"
+        )
+        self._btn_stop.clicked.connect(self._cancel_task)
+        self._btn_stop.setVisible(False)
+        btn_col.addWidget(self._btn_stop)
+
+        input_lay.addLayout(btn_col)
+
+        self._task_input.installEventFilter(self)
 
         center_lay.addWidget(input_frame)
+
+        # ════════════════════════════════════════
+        #  RIGHT PANEL — Preview + Tool Calls (VSCode-style side panel)
+        # ════════════════════════════════════════
+        right_panel = QWidget()
+        right_panel.setMinimumWidth(280)
+        right_panel.setMaximumWidth(600)
+        right_lay = QVBoxLayout(right_panel)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setSpacing(0)
+
+        right_tabs = QTabWidget()
+        right_tabs.setDocumentMode(True)
+        right_tabs.setStyleSheet(
+            "QTabWidget::pane{border:none;background:#0d1117;}"
+            "QTabBar::tab{background:#161b22;color:#8b949e;border:none;"
+            "border-bottom:2px solid transparent;padding:8px 14px;font-size:11px;}"
+            "QTabBar::tab:selected{color:#f0f6fc;border-bottom:2px solid #f78166;}"
+        )
+
+        # ── Preview tab (file content viewer) ──
+        preview_tab = QWidget()
+        preview_lay = QVBoxLayout(preview_tab)
+        preview_lay.setContentsMargins(4, 4, 4, 4)
+        preview_lay.setSpacing(4)
+
+        self._preview_path = QLabel(_t("preview_click"))
+        self._preview_path.setStyleSheet(
+            "color:#8b949e;font-size:11px;padding:4px 8px;"
+            "background:#161b22;border-radius:4px;"
+        )
+        preview_lay.addWidget(self._preview_path)
+
+        self._preview_output = QTextBrowser()
+        self._preview_output.setReadOnly(True)
+        self._preview_output.setStyleSheet(
+            "QTextBrowser{background:#0d1117;border:1px solid #21262d;border-radius:4px;"
+            "font-family:'Consolas','Courier New',monospace;font-size:12px;"
+            "color:#c9d1d9;padding:8px;}"
+        )
+        preview_lay.addWidget(self._preview_output)
+
+        right_tabs.addTab(preview_tab, _t("tab_preview"))
+
+        # ── Tool Calls tab ──
+        tool_tab = QWidget()
+        tool_lay = QVBoxLayout(tool_tab)
+        tool_lay.setContentsMargins(0, 0, 0, 0)
+        self._tool_panel = ToolCallPanel()
+        tool_lay.addWidget(self._tool_panel)
+        right_tabs.addTab(tool_tab, _t("tab_tools"))
+
+        right_lay.addWidget(right_tabs)
 
         # ── Assemble splitter ──
         main_sp.addWidget(sidebar)
         main_sp.addWidget(center)
-        main_sp.setSizes([250, 800])
+        main_sp.addWidget(right_panel)
+        main_sp.setSizes([220, 600, 320])
         main_sp.setStretchFactor(0, 0)
         main_sp.setStretchFactor(1, 1)
+        main_sp.setStretchFactor(2, 0)
 
         ml.addWidget(main_sp)
 
@@ -1684,14 +2004,14 @@ class GanggeDesktop(QMainWindow):
     def _open_settings(self):
         """Open a settings dialog (like VS Code's settings panel)."""
         dlg = QDialog(self)
-        dlg.setWindowTitle("⚙ 设置 - Gangge Code")
+        dlg.setWindowTitle(_t("settings_title"))
         dlg.setMinimumSize(520, 520)
         dlg.setStyleSheet("QDialog{background:#0d1117;}")
 
         layout = QVBoxLayout(dlg)
         layout.setSpacing(12)
 
-        title = QLabel("设置")
+        title = QLabel(_t("settings_heading"))
         title.setStyleSheet("color:#f0f6fc;font-size:16px;font-weight:bold;padding:4px 0;")
         layout.addWidget(title)
 
@@ -1719,21 +2039,21 @@ class GanggeDesktop(QMainWindow):
         _api_key.setEchoMode(QLineEdit.EchoMode.Password)
         _api_key.setPlaceholderText("API Key...")
         _api_key.setText(self._api_key_input.text())
-        lf.addRow("API Key:", _api_key)
+        lf.addRow(_t("settings_api_key"), _api_key)
 
         _model = QComboBox()
         _model.setEditable(True)
         for i in range(self._model_combo.count()):
             _model.addItem(self._model_combo.itemText(i), self._model_combo.itemData(i))
         _model.setCurrentText(self._model_combo.currentText())
-        lf.addRow("Model:", _model)
+        lf.addRow(_t("settings_model"), _model)
 
         _base_url = QLineEdit()
         _base_url.setPlaceholderText("API Base URL (如需要)")
         _base_url.setText(self._base_url_input.text())
-        lf.addRow("Base URL:", _base_url)
+        lf.addRow(_t("settings_base_url"), _base_url)
 
-        _show_key = QCheckBox("显示 API Key")
+        _show_key = QCheckBox(_t("settings_show_key"))
         _show_key.toggled.connect(
             lambda chk: _api_key.setEchoMode(
                 QLineEdit.EchoMode.Normal if chk else QLineEdit.EchoMode.Password
@@ -1743,7 +2063,7 @@ class GanggeDesktop(QMainWindow):
         form.addWidget(llm_g)
 
         # ── Advanced ──
-        ad_g = QGroupBox("高级设置")
+        ad_g = QGroupBox(_t("settings_advanced"))
         ad_g.setStyleSheet(llm_g.styleSheet())
         af = QFormLayout(ad_g)
         af.setSpacing(6)
@@ -1751,35 +2071,44 @@ class GanggeDesktop(QMainWindow):
         _rounds = QSpinBox()
         _rounds.setRange(5, 100)
         _rounds.setValue(self._max_rounds_spin.value())
-        af.addRow("最大轮数:", _rounds)
+        af.addRow(_t("settings_max_rounds"), _rounds)
 
-        _auto_allow = QCheckBox("自动允许安全操作")
+        _auto_allow = QCheckBox(_t("settings_auto_allow"))
         _auto_allow.setChecked(self._auto_allow_cb.isChecked())
         af.addRow("", _auto_allow)
 
-        _auto_inject = QCheckBox("自动注入项目上下文")
+        _auto_inject = QCheckBox(_t("settings_auto_inject"))
         _auto_inject.setChecked(self._auto_inject_cb.isChecked())
         af.addRow("", _auto_inject)
 
-        _test_verify = QCheckBox("自动触发测试验证")
+        _test_verify = QCheckBox(_t("settings_test_verify"))
         _test_verify.setChecked(self._test_verify_cb.isChecked())
         af.addRow("", _test_verify)
 
-        _git_commit = QCheckBox("任务完成后自动 Git 提交")
+        _git_commit = QCheckBox(_t("settings_git_commit"))
         _git_commit.setChecked(self._git_commit_cb.isChecked())
         af.addRow("", _git_commit)
 
-        _plan_mode = QCheckBox("规划模式 (先出计划后执行)")
+        _plan_mode = QCheckBox(_t("settings_plan_mode"))
         _plan_mode.setChecked(self._plan_mode_cb.isChecked())
         af.addRow("", _plan_mode)
+
+        _lang = QComboBox()
+        _lang.addItem("中文", "zh")
+        _lang.addItem("English", "en")
+        current_lang = get_language()
+        idx = _lang.findData(current_lang)
+        if idx >= 0:
+            _lang.setCurrentIndex(idx)
+        af.addRow(_t("settings_language"), _lang)
         form.addWidget(ad_g)
 
         # ── Extra Prompt ──
-        ex_g = QGroupBox("额外 System Prompt")
+        ex_g = QGroupBox(_t("settings_extra_prompt"))
         ex_g.setStyleSheet(llm_g.styleSheet())
         ex_lay = QVBoxLayout(ex_g)
         _extra = QPlainTextEdit()
-        _extra.setPlaceholderText("额外的指令，如编码规范、测试要求...")
+        _extra.setPlaceholderText(_t("extra_prompt_placeholder"))
         _extra.setMaximumHeight(100)
         _extra.setPlainText(self._extra_prompt.toPlainText())
         ex_lay.addWidget(_extra)
@@ -1792,7 +2121,7 @@ class GanggeDesktop(QMainWindow):
         # Buttons
         btn_bar = QHBoxLayout()
         btn_bar.addStretch()
-        cancel_btn = QPushButton("取消")
+        cancel_btn = QPushButton(_t("btn_cancel"))
         cancel_btn.setStyleSheet(
             "QPushButton{background:#21262d;color:#c9d1d9;border:1px solid #30363d;"
             "border-radius:6px;padding:8px 20px;font-size:13px;}"
@@ -1801,7 +2130,7 @@ class GanggeDesktop(QMainWindow):
         cancel_btn.clicked.connect(dlg.reject)
         btn_bar.addWidget(cancel_btn)
 
-        ok_btn = QPushButton("✅ 保存设置")
+        ok_btn = QPushButton(_t("btn_save"))
         ok_btn.setStyleSheet(
             "QPushButton{background:#238636;color:#fff;border-radius:6px;padding:8px 24px;"
             "font-size:13px;font-weight:600;}"
@@ -1826,9 +2155,18 @@ class GanggeDesktop(QMainWindow):
             self._git_commit_cb.setChecked(_git_commit.isChecked())
             self._plan_mode_cb.setChecked(_plan_mode.isChecked())
             self._extra_prompt.setPlainText(_extra.toPlainText())
+            self._lang_combo.setCurrentIndex(_lang.currentIndex())
             self._update_provider_fields()
             self._save_settings()
             self._sync_env_file()
+            # Apply language change
+            new_lang = _lang.currentData()
+            if new_lang != get_language():
+                set_language(new_lang)
+                QMessageBox.information(
+                    dlg, _t("settings_heading"),
+                    "语言已切换，重启应用后完全生效。\nLanguage changed. Restart to apply fully."
+                )
 
     def _sync_env_file(self):
         """Sync desktop settings back to .env file so CLI also picks them up."""
@@ -1855,6 +2193,7 @@ class GanggeDesktop(QMainWindow):
 
         updates = {
             "LLM_PROVIDER": provider,
+            "GANGGE_LANG": self._lang_combo.currentData(),
             api_key_map.get(provider, ""): self._api_key_input.text(),
             model_map.get(provider, ""): self._model_combo.currentText(),
         }
@@ -1904,9 +2243,9 @@ class GanggeDesktop(QMainWindow):
     # ── Session ───────────────────────────────────────────────
     def _new_session(self):
         self._clear_output()
-        self._diff_tab.clear_entries()
+        self._tool_panel.clear_entries()
         ws = self._ws_input.text().strip()
-        sid = self._db.create_session("新会话", ws)
+        sid = self._db.create_session(_t("session_new"), ws)
         self._current_session_id = sid
         self._refresh_session_list()
         # Select the new session in the list
@@ -1915,7 +2254,7 @@ class GanggeDesktop(QMainWindow):
             if item and item.data(Qt.ItemDataRole.UserRole) == sid:
                 self._session_list.setCurrentItem(item)
                 break
-        self._status_label.setText(f"新会话: {sid}")
+        self._status_label.setText(_t("status_new_session", sid=sid))
 
     def _refresh_session_list(self):
         self._session_list.clear()
@@ -1932,7 +2271,7 @@ class GanggeDesktop(QMainWindow):
 
         # 如果当前工作目录有会话，在列表底部加分隔提示
         if current_ws and sessions:
-            sep = QListWidgetItem(f"─ {len(sessions)} 个会话 ─")
+            sep = QListWidgetItem(_t("session_count", n=len(sessions)))
             sep.setFlags(sep.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             sep.setForeground(QColor("#666666"))
             self._session_list.addItem(sep)
@@ -1954,13 +2293,10 @@ class GanggeDesktop(QMainWindow):
         total = self._db.count_messages(sid)
 
         if total > self._db.MAX_LOAD_MESSAGES:
-            hint = (
-                f"📦 该会话共 {total} 条消息（聚合后），"
-                f"仅显示最近 {self._db.MAX_LOAD_MESSAGES} 条。"
-            )
-            self._append_output(f"📂 加载会话: {item.text()}\n{hint}\n", "system")
+            hint = _t("session_load_with_hint", total=total, max=self._db.MAX_LOAD_MESSAGES)
+            self._append_output(_t("session_load", name=item.text()) + f"\n{hint}\n", "system")
         else:
-            self._append_output(f"📂 加载会话: {item.text()} ({total} 条消息)\n", "system")
+            self._append_output(_t("session_load_count", name=item.text(), total=total) + "\n", "system")
         self._append_output("─" * 60 + "\n", "system")
 
         # 渲染消息 — tool 角色只显示 80 字符摘要
@@ -1986,10 +2322,10 @@ class GanggeDesktop(QMainWindow):
                 self._append_output(f"    {icon} [{tid}] {summary}...", "tool")
 
         # Load tool calls
-        self._diff_tab.clear_entries()
+        self._tool_panel.clear_entries()
         calls = self._db.load_tool_calls(sid)
         for c in calls:
-            self._diff_tab.add_entry(c["tool_name"], c["output"][:200], c["is_error"], c["diff"])
+            self._tool_panel.add_entry(c["tool_name"], c["output"][:200], c["is_error"], c["diff"])
 
         # Restore session workspace if set
         sess = self._db.get_session(sid)
@@ -2000,19 +2336,19 @@ class GanggeDesktop(QMainWindow):
                 self._file_browser.set_root(sess["workspace"])
                 self._refresh_session_list()  # 工作目录变了 → 刷新会话列表
 
-        self._status_label.setText(f"会话: {sess['title'] if sess else sid}")
+        self._status_label.setText(_t("status_session", title=sess['title'] if sess else sid))
 
     def _delete_session(self):
         item = self._session_list.currentItem()
         if not item:
             return
         sid = item.data(Qt.ItemDataRole.UserRole)
-        if QMessageBox.question(self, "确认删除", f"删除会话 {item.text()}?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(self, _t("session_confirm_delete"), _t("session_delete_msg", name=item.text()), QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
             self._db.delete_session(sid)
             if self._current_session_id == sid:
                 self._current_session_id = ""
                 self._clear_output()
-                self._diff_tab.clear_entries()
+                self._tool_panel.clear_entries()
             self._refresh_session_list()
 
     def _rename_session(self):
@@ -2021,7 +2357,7 @@ class GanggeDesktop(QMainWindow):
             return
         sid = item.data(Qt.ItemDataRole.UserRole)
         title = item.data(Qt.ItemDataRole.UserRole + 1)
-        new_title, ok = QInputDialog.getText(self, "重命名会话", "会话名称:", text=title)
+        new_title, ok = QInputDialog.getText(self, _t("session_rename"), _t("session_rename_label"), text=title)
         if ok and new_title:
             self._db.update_session(sid, title=new_title)
             self._refresh_session_list()
@@ -2034,9 +2370,81 @@ class GanggeDesktop(QMainWindow):
         # But we update the session timestamp
         self._db.update_session(self._current_session_id, updated_at=datetime.now().isoformat())
 
+    # ── Input auto-resize & Enter handling ──────────────────
+    def _auto_resize_input(self):
+        doc = self._task_input.document()
+        h = int(doc.size().height()) + 16
+        h = max(36, min(h, 100))
+        self._task_input.setFixedHeight(h)
+
+    def eventFilter(self, obj, event):
+        if obj == self._task_input and event.type() == event.Type.KeyPress:
+            from PyQt6.QtCore import QEvent
+            from PyQt6.QtGui import QKeyEvent
+            ke = event
+            # Shift+Enter = insert newline
+            if ke.key() == Qt.Key.Key_Return and ke.modifiers() == Qt.KeyboardModifier.ShiftModifier:
+                cursor = self._task_input.textCursor()
+                cursor.insertText("\n")
+                return True
+            # Ctrl+Enter or plain Enter (single line) = run
+            if ke.key() == Qt.Key.Key_Return:
+                if ke.modifiers() == Qt.KeyboardModifier.ControlModifier:
+                    self._run_task()
+                    return True
+                # If single line (no newline in text), Enter runs
+                text = self._task_input.toPlainText()
+                if "\n" not in text:
+                    self._run_task()
+                    return True
+                # Multi-line: Enter inserts newline (like Shift+Enter)
+                cursor = self._task_input.textCursor()
+                cursor.insertText("\n")
+                return True
+        return super().eventFilter(obj, event)
+
     # ── Actions ───────────────────────────────────────────────
     def _clear_output(self):
         self._output.clear()
+
+    def _rollback_checkpoint(self):
+        from PyQt6.QtWidgets import QMessageBox
+        workspace = self._ws_input.text().strip()
+        if not workspace:
+            self._status_label.setText(_t("status_no_workspace"))
+            return
+        from gangge.layer4_tools.shadow_git import ShadowGit
+        sg = ShadowGit(workspace)
+        if not sg.is_available():
+            self._status_label.setText(_t("status_no_git"))
+            return
+        checkpoints = sg.list_checkpoints(limit=10)
+        gangge_cps = [c for c in checkpoints if c.get("is_checkpoint")]
+        if not gangge_cps:
+            self._status_label.setText(_t("status_no_checkpoint"))
+            return
+        items = [f"{c['hash']} — {c['date'][:16]} {c['message']}" for c in gangge_cps[:8]]
+        item, ok = QInputDialog.getItem(
+            self, _t("rollback_title"), _t("rollback_select"),
+            items, 0, False,
+        )
+        if not ok or not item:
+            return
+        selected_hash = item.split(" ")[0]
+        reply = QMessageBox.warning(
+            self, _t("rollback_confirm"),
+            _t("rollback_confirm_msg", hash=selected_hash),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        if sg.rollback(selected_hash):
+            self._append_output(_t("rollback_done", hash=selected_hash), "system")
+            self._file_browser.set_root(workspace)
+            self._status_label.setText(_t("status_rollback_ok_hash", hash=selected_hash))
+        else:
+            self._status_label.setText(_t("status_rollback_fail"))
 
     def _save_output(self):
         path, _ = QFileDialog.getSaveFileName(self, "保存输出", "gangge_output.txt", "文本文件 (*.txt);;所有文件 (*)")
@@ -2051,6 +2459,43 @@ class GanggeDesktop(QMainWindow):
             self._ws_input.setText(path)
             self._file_browser.set_root(path)
             self._status_label.setText(f"工作目录: {path}")
+
+    def _on_file_selected(self, file_path: str):
+        try:
+            p = Path(file_path)
+            if not p.exists() or not p.is_file():
+                return
+            size_kb = p.stat().st_size / 1024
+            ext = p.suffix.lower()
+            image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"}
+            binary_exts = {".exe", ".dll", ".so", ".pyc", ".pyd", ".zip", ".tar", ".gz", ".rar", ".7z", ".pdf", ".doc", ".docx", ".xlsx", ".pptx", ".db", ".sqlite"}
+
+            self._preview_path.setText(f"📄 {p.name} ({size_kb:.1f} KB)")
+
+            if ext in binary_exts:
+                self._preview_output.setPlainText(f"[二进制文件] {file_path}\n大小: {size_kb:.1f} KB")
+                return
+            if ext in image_exts:
+                self._preview_output.setPlainText(f"[图片文件] {file_path}\n大小: {size_kb:.1f} KB")
+                return
+            if size_kb > 500:
+                self._preview_output.setPlainText(f"[文件过大] {file_path}\n大小: {size_kb:.1f} KB\n请使用 read_file 工具读取")
+                return
+
+            content = p.read_text(encoding="utf-8", errors="replace")
+            lines = content.splitlines()
+            total = len(lines)
+            max_show = 500
+            shown = lines[:max_show]
+            truncated = total > max_show
+
+            numbered = "\n".join(f"{i+1:>5}│ {line}" for i, line in enumerate(shown))
+            if truncated:
+                numbered += f"\n\n... 省略 {total - max_show} 行 (共 {total} 行)"
+
+            self._preview_output.setPlainText(numbered)
+        except Exception as e:
+            self._preview_output.setPlainText(f"读取失败: {e}")
 
     def _update_provider_fields(self):
         key = self._provider_combo.currentData()
@@ -2210,11 +2655,22 @@ class GanggeDesktop(QMainWindow):
 
         self._llm = llm
         self._running = True
-        self._btn_run.setEnabled(False)
+        self._btn_run.setVisible(False)
         self._batch_btn.setEnabled(False)
+        self._btn_stop.setVisible(True)
         self._btn_cancel.setEnabled(True)
+        self._task_input.setEnabled(False)
         self._status_progress.setVisible(True)
         self._status_progress.setRange(0, 0)
+        self._stats_label.setText("")
+        self._timer_label.setText("⏱ 00:00")
+
+        # Start elapsed timer
+        self._start_time = time.monotonic()
+        from PyQt6.QtCore import QTimer
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
+        self._elapsed_timer.start(1000)
 
         batch_text = f" [{batch_index + 1}/{batch_total}]" if batch_total > 1 else ""
         self._status_label.setText(f"🚀 执行{batch_text}...")
@@ -2236,6 +2692,7 @@ class GanggeDesktop(QMainWindow):
         self._worker.text_block.connect(self._append_output)
         self._worker.tool_call_sig.connect(self._on_tool_call)
         self._worker.finished.connect(lambda s: self._on_finished(s, llm))
+        self._worker.ask_user_sig.connect(self._on_ask_user)
         # ── CHANGE: 方案C — turn_complete → save_turn ──────────
         if self._current_session_id:
             sid = self._current_session_id
@@ -2253,14 +2710,41 @@ class GanggeDesktop(QMainWindow):
             self._batch_queue.clear()
             self._on_finished({}, None)
 
+    def _update_elapsed(self):
+        if hasattr(self, "_start_time"):
+            elapsed = int(time.monotonic() - self._start_time)
+            mins, secs = divmod(elapsed, 60)
+            self._timer_label.setText(f"⏱ {mins:02d}:{secs:02d}")
+
     def _on_finished(self, summary: dict, llm: BaseLLM | None):
         self._running = False
-        self._btn_run.setEnabled(True)
+        self._btn_run.setVisible(True)
+        self._btn_stop.setVisible(False)
         self._batch_btn.setEnabled(True)
         self._btn_cancel.setEnabled(False)
+        self._task_input.setEnabled(True)
         self._status_progress.setVisible(False)
         self._status_progress.setRange(0, 100)
         self._status_progress.setValue(0)
+
+        # Stop elapsed timer
+        if hasattr(self, "_elapsed_timer") and self._elapsed_timer:
+            self._elapsed_timer.stop()
+
+        # Enable rollback button if checkpoint exists
+        has_checkpoint = bool(summary and summary.get("shadow_checkpoint_before"))
+        self._btn_rollback.setEnabled(has_checkpoint)
+
+        # Update final stats
+        if summary and not summary.get("error"):
+            r = summary.get("rounds", 0)
+            c = summary.get("tool_calls", 0)
+            tokens = summary.get("tokens", {})
+            inp = tokens.get("input", 0)
+            out = tokens.get("output", 0)
+            cost = summary.get("cost", "")
+            cost_str = f" | {cost}" if cost else ""
+            self._stats_label.setText(f"🔄 {r} 轮 | 🔧 {c} 次 | 📥 {inp} | 📤 {out}{cost_str}")
 
         # ── Plan mode: show confirmation dialog ──
         if summary.get("plan_mode") and summary.get("final_response"):
@@ -2323,13 +2807,23 @@ class GanggeDesktop(QMainWindow):
             if self._batch_queue and llm:
                 self._execute_batch_next(llm)
 
+    def _on_ask_user(self, question: str):
+        answer, ok = QInputDialog.getText(
+            self, "AI 需要你的输入", question,
+        )
+        if ok:
+            self._worker._ask_user_answer = answer.strip()
+        else:
+            self._worker._ask_user_answer = ""
+        self._worker._ask_user_event.set()
+
     def _on_tool_call(self, tool_name: str, output: str, is_error: bool, diff: str):
-        self._diff_tab.add_entry(tool_name, output, is_error, diff)
+        self._tool_panel.add_entry(tool_name, output, is_error, diff)
         # Persist to DB
         if self._current_session_id:
             self._db.save_tool_call(
                 self._current_session_id,
-                round_num=self._diff_tab._table.rowCount(),
+                round_num=self._tool_panel._table.rowCount(),
                 tool_name=tool_name,
                 tool_input="",
                 tool_output=output,
@@ -2338,24 +2832,80 @@ class GanggeDesktop(QMainWindow):
             )
 
     def _append_output(self, text: str, role: str = ""):
-        css = {"user": "color:#58a6ff;font-weight:bold", "assistant": "color:#3fb950",
-               "tool": "color:#d29922", "system": "color:#8b949e;font-style:italic",
-               "error": "color:#f85149;font-weight:bold"}.get(role, "")
+        """Render message as a styled bubble card."""
         cursor = self._output.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
+        # ── Bubble styling by role ──
+        bubble_cfg = {
+            "user": {
+                "icon": "👤",
+                "title": "你",
+                "bg": "#1f2937",
+                "border": "#374151",
+                "text_color": "#e5e7eb",
+                "align": "left",
+            },
+            "assistant": {
+                "icon": "🤖",
+                "title": "AI",
+                "bg": "#111827",
+                "border": "#1f6feb",
+                "text_color": "#c9d1d9",
+                "align": "left",
+            },
+            "tool": {
+                "icon": "🔧",
+                "title": "工具",
+                "bg": "#1a1500",
+                "border": "#d29922",
+                "text_color": "#d29922",
+                "align": "left",
+            },
+            "system": {
+                "icon": "ℹ️",
+                "title": "系统",
+                "bg": "#0d1117",
+                "border": "#30363d",
+                "text_color": "#8b949e",
+                "align": "center",
+            },
+            "error": {
+                "icon": "❌",
+                "title": "错误",
+                "bg": "#3a1b1b",
+                "border": "#f85149",
+                "text_color": "#f85149",
+                "align": "left",
+            },
+        }.get(role, {
+            "icon": "",
+            "title": "",
+            "bg": "#0d1117",
+            "border": "#30363d",
+            "text_color": "#c9d1d9",
+            "align": "left",
+        })
+
+        cfg = bubble_cfg
         escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        # Simple code block handling
+
+        # Code block handling with syntax highlighting hints
         lines = escaped.split("\n")
         parts = []
         in_code = False
+        code_lang = ""
         for line in lines:
-            if line.strip().startswith("```"):
+            stripped = line.strip()
+            if stripped.startswith("```"):
                 if in_code:
                     parts.append("</code></pre>")
                     in_code = False
+                    code_lang = ""
                 else:
-                    parts.append("<pre><code>")
+                    code_lang = stripped[3:].strip()
+                    lang_label = f'<div style="color:#8b949e;font-size:11px;padding:2px 8px;background:#161b22;border-bottom:1px solid #30363d;">{code_lang}</div>' if code_lang else ""
+                    parts.append(f'{lang_label}<pre style="background:#161b22;padding:8px 12px;margin:4px 0;border-radius:4px;overflow-x:auto;"><code style="color:#c9d1d9;font-family:Consolas,monospace;font-size:12px;line-height:1.5;">')
                     in_code = True
                 continue
             if in_code:
@@ -2363,19 +2913,42 @@ class GanggeDesktop(QMainWindow):
             elif line == "":
                 parts.append("<br>")
             else:
+                # Inline code `...`
+                import re
+                line = re.sub(r'`([^`]+)`', r'<code style="background:#161b22;padding:1px 4px;border-radius:3px;color:#79c0ff;font-family:Consolas,monospace;font-size:12px;">\1</code>', line)
+                # Bold **...**
+                line = re.sub(r'\*\*([^*]+)\*\*', r'<strong style="color:#f0f6fc;">\1</strong>', line)
                 parts.append(line + "<br>")
         if in_code:
             parts.append("</code></pre>")
 
-        html = "".join(parts)
-        if css:
-            html = f'<span style="{css}">{html}</span>'
+        content_html = "".join(parts)
 
-        cursor.insertHtml(html)
+        # Build bubble HTML
+        if role == "system" and not text.strip().startswith("📋"):
+            # Compact system messages (dividers, separators)
+            bubble_html = (
+                f'<div style="text-align:center;margin:6px 0;">'
+                f'<span style="color:#484f58;font-size:12px;">{content_html}</span>'
+                f'</div>'
+            )
+        else:
+            margin = "margin:8px 40px 8px 8px;" if cfg["align"] == "left" else "margin:8px;"
+            bubble_html = (
+                f'<div style="{margin}padding:10px 14px;background:{cfg["bg"]};'
+                f'border:1px solid {cfg["border"]};border-radius:10px;'
+                f'border-left:3px solid {cfg["border"]};">'
+                f'<div style="font-size:11px;color:#8b949e;margin-bottom:4px;">'
+                f'{cfg["icon"]} <strong style="color:{cfg["text_color"]};">{cfg["title"]}</strong>'
+                f'<span style="float:right;color:#484f58;">{datetime.now().strftime("%H:%M")}</span>'
+                f'</div>'
+                f'<div style="color:{cfg["text_color"]};font-size:13px;line-height:1.6;">'
+                f'{content_html}</div></div>'
+            )
+
+        cursor.insertHtml(bubble_html)
         self._output.setTextCursor(cursor)
         self._output.ensureCursorVisible()
-
-        # ── CHANGE: 方案C — _append_output 只做 UI 渲染，DB 由 turn_complete 信号写入
 
     # ── Settings ──────────────────────────────────────────────
     def _save_settings(self):
@@ -2392,6 +2965,7 @@ class GanggeDesktop(QMainWindow):
         self._settings.setValue("test_verify", self._test_verify_cb.isChecked())
         self._settings.setValue("git_commit", self._git_commit_cb.isChecked())
         self._settings.setValue("extra_prompt", self._extra_prompt.toPlainText())
+        self._settings.setValue("language", self._lang_combo.currentData())
         self._settings.setValue("window_geometry", self.saveGeometry())
         self._settings.setValue("window_state", self.saveState())
 
@@ -2432,6 +3006,12 @@ class GanggeDesktop(QMainWindow):
         ep = self._settings.value("extra_prompt", "")
         if ep:
             self._extra_prompt.setPlainText(ep)
+        lang = self._settings.value("language", "")
+        if lang:
+            idx = self._lang_combo.findData(lang)
+            if idx >= 0:
+                self._lang_combo.setCurrentIndex(idx)
+                set_language(lang)
         geo = self._settings.value("window_geometry")
         if geo:
             self.restoreGeometry(geo)

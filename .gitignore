@@ -30,6 +30,12 @@ gangge_debug*.log
 # Project specific
 gangge_projects/
 .gangge/
+.gangge_data/
 
 # Desktop
 desktop/__pycache__/
+
+# Test / Coverage
+.pytest_cache/
+htmlcov/
+.coverage

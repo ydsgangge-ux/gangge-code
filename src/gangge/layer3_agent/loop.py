@@ -18,6 +18,7 @@ from gangge.layer3_agent.tools.registry import ToolRegistry
 from gangge.layer3_agent.tools.base import ToolResult
 from gangge.layer3_agent.prompts.system import build_system_prompt, detect_empty_workspace
 from gangge.layer3_agent.progress_emitter import ProgressEmitter, EventType
+from gangge.i18n import t
 from gangge.layer4_tools.mcp_client import MCPClientManager
 from gangge.layer4_permission.guard import (
     PermissionGuard,
@@ -107,12 +108,27 @@ class LoopConfig:
     enable_summary_compression: bool = True
     summary_compression_interval: int = 5  # every N rounds
 
+    # ── Sliding window: keep only recent N rounds, discard older ──
+    enable_sliding_window: bool = True
+    max_history_rounds: int = 6  # only keep recent N user/assistant pairs
+
+    # ── Tool result truncation ──
+    enable_tool_result_truncation: bool = True
+    tool_result_max_chars: int = 2000
+
+    # ── Lazy project map: only inject full index on first round ──
+    enable_lazy_project_map: bool = True
+
     # ── Memory Bank: project-level progress tracking ──
     memory_bank_progress: str = ""
     memory_bank_changelog: str = ""
+    memory_bank_decisions: str = ""
 
     # ── .ganggerules: project-specific rules ──
     ganggerules: str = ""
+
+    # ── ask_user callback: pause loop and wait for user input ──
+    ask_user_callback: Callable[[str], Awaitable[str]] | None = None
 
 
 @dataclass
@@ -193,20 +209,23 @@ class AgenticLoop:
     def _ensure_memory_bank(self) -> None:
         """Auto-load memory bank files from .gangge/ directory.
 
-        Reads progress.md and changelog.md into config fields
+        Reads progress.md, changelog.md, and decisions.md into config fields
         so they get injected into the system prompt.
         """
         gangge_dir = Path(self.config.workspace_dir) / ".gangge"
         progress_file = gangge_dir / "progress.md"
         changelog_file = gangge_dir / "changelog.md"
+        decisions_file = gangge_dir / "decisions.md"
 
         # Create .gangge/ with defaults if missing
         if not gangge_dir.exists():
             gangge_dir.mkdir(parents=True, exist_ok=True)
         if not progress_file.exists():
-            progress_file.write_text("# 项目进度\n\n进度: 0%\n（暂无记录）\n", encoding="utf-8")
+            progress_file.write_text(t("memory_progress_title"), encoding="utf-8")
         if not changelog_file.exists():
-            changelog_file.write_text("# 变更日志\n\n- 初始化记忆银行\n", encoding="utf-8")
+            changelog_file.write_text(t("memory_changelog_title"), encoding="utf-8")
+        if not decisions_file.exists():
+            decisions_file.write_text(t("memory_decisions_title"), encoding="utf-8")
 
         # Read content
         try:
@@ -217,22 +236,28 @@ class AgenticLoop:
             self.config.memory_bank_changelog = changelog_file.read_text(encoding="utf-8").strip()
         except Exception:
             self.config.memory_bank_changelog = ""
+        try:
+            self.config.memory_bank_decisions = decisions_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            self.config.memory_bank_decisions = ""
 
     def _save_memory_bank_update(self, update_text: str) -> None:
         """Save memory bank update text to .gangge/ files.
 
-        Parses the LLM's memory-bank block and writes to progress.md and changelog.md.
+        Parses the LLM's memory-bank block and writes to progress.md, changelog.md, and decisions.md.
         """
         if not update_text.strip():
             return
         gangge_dir = Path(self.config.workspace_dir) / ".gangge"
         progress_file = gangge_dir / "progress.md"
         changelog_file = gangge_dir / "changelog.md"
+        decisions_file = gangge_dir / "decisions.md"
 
-        # Try to extract progress and changelog sections from the update
+        # Try to extract progress, changelog, and decisions sections from the update
         import re as _re
-        progress_match = _re.search(r"(?:progress|进度)[：:]\s*(.+?)(?:\n|$)", update_text, _re.IGNORECASE | _re.DOTALL)
-        changelog_match = _re.search(r"(?:changelog|变更日志)[：:]\s*(.+?)$", update_text, _re.IGNORECASE | _re.DOTALL)
+        progress_match = _re.search(r"(?:progress|进度)[：:]\s*(.+?)(?=(?:changelog|变更日志|decision|决策)[：:]|$)", update_text, _re.IGNORECASE | _re.DOTALL)
+        changelog_match = _re.search(r"(?:changelog|变更日志)[：:]\s*(.+?)(?=(?:decision|决策)[：:]|$)", update_text, _re.IGNORECASE | _re.DOTALL)
+        decisions_match = _re.search(r"(?:decision|决策)[：:]\s*(.+?)$", update_text, _re.IGNORECASE | _re.DOTALL)
 
         if progress_match:
             new_progress = progress_match.group(1).strip()
@@ -256,6 +281,18 @@ class AgenticLoop:
                 except Exception as e:
                     logger.warning(f"[Memory Bank] 写入 changelog.md 失败: {e}")
 
+        if decisions_match:
+            new_decision = decisions_match.group(1).strip()
+            if new_decision:
+                new_entry = f"\n### {datetime.now().strftime('%Y-%m-%d %H:%M')}\n{new_decision}\n"
+                try:
+                    existing = decisions_file.read_text(encoding="utf-8") if decisions_file.exists() else ""
+                    decisions_file.write_text(existing + new_entry, encoding="utf-8")
+                    self.config.memory_bank_decisions = (existing + new_entry).strip()
+                    logger.info(f"[Memory Bank] decisions.md 已更新")
+                except Exception as e:
+                    logger.warning(f"[Memory Bank] 写入 decisions.md 失败: {e}")
+
     def _get_all_tool_defs(self) -> list:
         """获取内置工具 + MCP 工具的完整 definitions 列表。"""
         defs = list(self.tools.get_definitions())
@@ -264,22 +301,27 @@ class AgenticLoop:
             defs.extend(mcp_defs)
         return defs
 
-    def _build_system_prompt(self, reads_cache: dict[str, int] | None = None) -> str:
+    def _build_system_prompt(self, reads_cache: dict[str, int] | None = None, round_num: int = 0) -> str:
         prompt = build_system_prompt(
             workspace_dir=self.config.workspace_dir,
             project_context=self.config.project_context,
             plan_mode=self.config.plan_mode,
             memory_bank_progress=self.config.memory_bank_progress,
             memory_bank_changelog=self.config.memory_bank_changelog,
+            memory_bank_decisions=self.config.memory_bank_decisions,
         )
 
         # ── Inject .ganggerules ──
         if self.config.ganggerules:
             prompt += f"\n\n## 项目规则 (.ganggerules)\n{self.config.ganggerules}"
 
-        # ── Inject project map ──
+        # ── Inject project map (lazy loading) ──
         if self.config.project_map:
-            prompt += f"\n\n## 项目文件索引 (请利用这些信息定位文件)\n{self.config.project_map}"
+            if self.config.enable_lazy_project_map and round_num > 0:
+                file_count = self.config.project_map.count("\n") + 1
+                prompt += f"\n\n## 项目文件索引\n[项目索引已在第1轮加载，包含约 {file_count} 个条目，如需查看请用 list_dir 工具]"
+            else:
+                prompt += f"\n\n## 项目文件索引 (请利用这些信息定位文件)\n{self.config.project_map}"
 
         # ── Inject file registry ──
         if self.config.file_registry:
@@ -408,6 +450,48 @@ class AgenticLoop:
         ] + messages[safe_idx:]
         return compressed
 
+    def _trim_history(self, messages: list[Message]) -> list[Message]:
+        """Sliding window: keep only recent N rounds, discard older messages.
+
+        A "round" is a user/assistant pair (possibly followed by tool messages).
+        We count user messages as round boundaries and keep the last N rounds.
+        This is simpler and more reliable than summary compression.
+        """
+        max_rounds = self.config.max_history_rounds
+
+        # Find all USER message indices (these are round boundaries)
+        user_indices = []
+        for i, msg in enumerate(messages):
+            if msg.role == Role.USER:
+                user_indices.append(i)
+
+        # If we have fewer rounds than max, no trimming needed
+        if len(user_indices) <= max_rounds:
+            return messages
+
+        # Find the start index of the (len - max_rounds)-th user message
+        # This is where we start keeping messages
+        cutoff_idx = user_indices[-max_rounds]
+
+        # But we must not split an assistant(tool_calls) + tool messages pair
+        # Walk backwards from cutoff to find a safe boundary
+        safe_idx = cutoff_idx
+        while safe_idx > 0:
+            msg = messages[safe_idx]
+            if msg.role == Role.USER:
+                break
+            if msg.role == Role.ASSISTANT:
+                has_tc = any(b.type == ContentType.TOOL_USE for b in msg.content)
+                if not has_tc:
+                    break
+            safe_idx -= 1
+
+        trimmed = messages[safe_idx:]
+        dropped = len(messages) - len(trimmed)
+        if dropped > 0:
+            logger.info(f"Sliding window: dropped {dropped} old messages, keeping {len(trimmed)}")
+        return trimmed
+
     async def _emit(self, block: ContentBlock) -> None:
         """Emit a content block to the stream callback."""
         if self._stream_callback:
@@ -421,6 +505,18 @@ class AgenticLoop:
             return tool_input.get("path", "")
         return tool_name
 
+    async def _auto_lint_check(self, file_path: str) -> str:
+        """Run a quick lint check on a modified file. Returns summary or empty string."""
+        try:
+            from gangge.layer3_agent.tools.lint_check import LintCheckTool
+            checker = LintCheckTool(workspace=self.config.workspace_dir)
+            result = await checker.execute(path=file_path)
+            if result.is_error:
+                return f"[lint] {result.output}"
+            return ""
+        except Exception:
+            return ""
+
     async def run(self, messages: list[Message]) -> LoopResult:
         """Run the agentic loop until LLM returns end_turn.
 
@@ -433,6 +529,16 @@ class AgenticLoop:
         # ── PATCH: include MCP tool definitions ──
         # ── Load Memory Bank from .gangge/ files ──
         self._ensure_memory_bank()
+
+        # ── Shadow Git: auto-checkpoint before AI starts ──
+        shadow_checkpoint = None
+        if self.config.workspace_dir:
+            from gangge.layer4_tools.shadow_git import ShadowGit
+            sg = ShadowGit(self.config.workspace_dir)
+            if sg.is_available() or sg.ensure_init():
+                shadow_checkpoint = sg.checkpoint("before AI task")
+                if shadow_checkpoint:
+                    logger.info(f"Shadow Git checkpoint: {shadow_checkpoint}")
 
         tool_defs = self._get_all_tool_defs()
         is_empty_dir = detect_empty_workspace(self.config.workspace_dir)
@@ -455,12 +561,17 @@ class AgenticLoop:
 
             # ── Rebuild system prompt with fresh project context ──
             self.config.file_registry = file_registry
-            system = self._build_system_prompt(reads_cache=reads_cache)
+            system = self._build_system_prompt(reads_cache=reads_cache, round_num=round_num)
             self.emitter.emit(EventType.THINKING, f"正在思考...")
 
-            # ── Summary compression every N rounds ──
+            # ── Sliding window: trim old messages ──
+            if self.config.enable_sliding_window and round_num > 0:
+                messages = self._trim_history(messages)
+
+            # ── Summary compression every N rounds (fallback, disabled when sliding window is on) ──
             if (
-                self.config.enable_summary_compression
+                not self.config.enable_sliding_window
+                and self.config.enable_summary_compression
                 and round_num > 0
                 and round_num % self.config.summary_compression_interval == 0
             ):
@@ -575,13 +686,25 @@ class AgenticLoop:
                 # ── Save Memory Bank update to files ──
                 if mb_extracted:
                     self._save_memory_bank_update(mb_extracted)
+
+                # ── Shadow Git: post-task checkpoint ──
+                after_checkpoint = None
+                if self.config.workspace_dir and has_modified_files:
+                    from gangge.layer4_tools.shadow_git import ShadowGit
+                    sg = ShadowGit(self.config.workspace_dir)
+                    after_checkpoint = sg.checkpoint("after AI task completed")
+
                 self.emitter.emit_done(total_steps=round_num + 1)
                 return LoopResult(
                     final_response=final_text,
                     tool_executions=executions,
                     total_rounds=round_num + 1,
                     total_tokens=total_tokens,
-                    extra={"memory_bank_update": mb_extracted},
+                    extra={
+                        "memory_bank_update": mb_extracted,
+                        "shadow_checkpoint_before": shadow_checkpoint or "",
+                        "shadow_checkpoint_after": after_checkpoint or "",
+                    },
                 )
 
             # 5. Process tool calls
@@ -623,17 +746,44 @@ class AgenticLoop:
                 # Execute tool
                 import time
                 _t0 = time.monotonic()
+
+                # ── Special handling: ask_user ──
+                if tool_name == "ask_user":
+                    question = tool_input.get("question", "")
+                    await self._emit(ContentBlock(
+                        type=ContentType.TEXT,
+                        text=f"\n[yellow]❓ {question}[/yellow]\n",
+                    ))
+                    if self.config.ask_user_callback:
+                        user_answer = await self.config.ask_user_callback(question)
+                    else:
+                        user_answer = ""
+                    result = ToolResult(
+                        output=user_answer if user_answer else "(用户未提供输入)",
+                    )
                 # ── PATCH: MCP tool dispatch ──
-                if "__" in tool_name and self.mcp_manager:
+                elif "__" in tool_name and self.mcp_manager:
                     output = self.mcp_manager.call_tool(tool_name, tool_input)
                     result = ToolResult(output=output, is_error=output.startswith("[错误]"))
                 else:
                     result = await self.tools.execute(tool_name, tool_input)
+
                 _elapsed = int((time.monotonic() - _t0) * 1000)
-                # ──────────────────────────────────
+
+                # ── Tool result truncation ──
+                result_output = result.output
+                if (
+                    self.config.enable_tool_result_truncation
+                    and len(result_output) > self.config.tool_result_max_chars
+                ):
+                    result_output = (
+                        result_output[:self.config.tool_result_max_chars]
+                        + f"\n...[截断，共{len(result_output)}字符]"
+                    )
+
                 tool_results_msg.add_tool_result(
                     call_id=tool_call.id,
-                    result=result.output,
+                    result=result_output,
                     is_error=result.is_error,
                 )
                 executions.append(ToolExecution(
@@ -656,6 +806,12 @@ class AgenticLoop:
                 if tool_name in ("write_file", "edit_file") and not result.is_error:
                     path = tool_input.get("path", "")
                     has_modified_files = True
+
+                    # ── Auto lint check after file modification ──
+                    lint_result = await self._auto_lint_check(path)
+                    if lint_result:
+                        result_output += f"\n\n{lint_result}"
+
                     if path:
                         # Scan file for classes/functions
                         try:

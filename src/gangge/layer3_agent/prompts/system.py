@@ -97,6 +97,11 @@ else:
 - 只在真正需要理解已有代码时调用
 - 禁止对刚刚自己写的文件调用 read_file
 
+### ask_user 工具
+- 当你需要用户提供信息才能继续时调用（比如仓库地址、密码、选择方案、确认操作等）
+- 调用后循环会暂停，等待用户输入，用户回答后继续执行
+- **不要自己猜测**用户的信息，不确定就问
+
 ---
 
 ## 错误处理规范
@@ -127,12 +132,41 @@ else:
 
 {memory_bank_summary}
 
+{memory_bank_decisions}
+
+### ⚡ 进度 100% 时的行为规则（非常重要）
+
+如果 Memory Bank 的 progress 显示进度为 100%（或所有任务已标记完成）：
+
+1. **禁止重新读取所有源文件** — 不要逐个 read_file 验证已有代码
+2. **直接运行最终验证** — 执行 `python main.py`、`pytest` 或项目入口命令
+3. **验证通过 → 报告完成**，不需要再做其他事
+4. **验证失败 → 只修复报错的部分**，不要重读无关文件
+
+违反此规则（进度 100% 仍逐文件读取验证）视为严重浪费轮次。
+
 任务完成时，请用 ```memory-bank 标记返回更新内容：
 ```
 memory-bank
 progress: 当前进度
 changelog: 本次变更
+decision: 关键技术决策（记录"为什么这么做"，而不仅是"做了什么"。例如：选择 SQLite 而非 JSON 是因为需要事务支持）
 ```
+
+---
+
+## 自检规范（批判者角色）
+
+每次写完代码后，在提交 tool_result 之前，先在脑中过一遍以下检查清单：
+
+1. **语法正确性**：代码能否通过 `pyright` / `ruff` 检查？（系统会自动运行 lint_check）
+2. **逻辑完整性**：是否有未处理的边界情况？是否有 `pass` 占位？
+3. **依赖一致性**：使用的库是否已在项目依赖中？导入路径是否正确？
+4. **风格一致性**：是否遵循项目现有的代码风格（命名、缩进、注释语言）？
+
+如果 lint_check 报告了错误，**必须立刻修复**，不要留给用户。
+
+---
 
 ## 禁止行为清单
 
@@ -202,6 +236,7 @@ def build_system_prompt(
     plan_mode: bool = False,
     memory_bank_progress: str = "",
     memory_bank_changelog: str = "",
+    memory_bank_decisions: str = "",
 ) -> str:
     """Build the full system prompt with project context and dynamic injection."""
     # Detect project status
@@ -217,11 +252,19 @@ def build_system_prompt(
     prompt = prompt.replace("{project_status}", project_status)
 
     memory_bank_summary = "暂无历史记录"
+    progress_is_complete = False
     if memory_bank_progress:
         memory_bank_summary = f"进度: {memory_bank_progress[:300]}"
+        if "100%" in memory_bank_progress or "已完成" in memory_bank_progress:
+            progress_is_complete = True
     if memory_bank_changelog:
         memory_bank_summary += f"\n变更日志: {memory_bank_changelog[:300]}"
     prompt = prompt.replace("{memory_bank_summary}", memory_bank_summary.strip())
+
+    decisions_summary = ""
+    if memory_bank_decisions:
+        decisions_summary = f"### 历史决策记录\n{memory_bank_decisions[:500]}\n\n⚠️ 请参考以上决策，避免重复犯错或推翻已做出的技术选择。"
+    prompt = prompt.replace("{memory_bank_decisions}", decisions_summary)
 
     parts = [prompt]
 
@@ -241,5 +284,16 @@ def build_system_prompt(
     # Add plan mode hint
     if plan_mode:
         parts.append(PLAN_MODE_PROMPT)
+
+    # Strong hint when progress is 100% — prevent re-reading all files
+    if progress_is_complete:
+        parts.append(
+            "\n## ⚡ 重要：项目进度已 100%\n\n"
+            "Memory Bank 显示所有任务已完成。请遵守以下规则：\n"
+            "1. **不要** 逐个 read_file 重新验证已有代码\n"
+            "2. **直接** 运行 `python main.py` 或 `pytest` 做最终验证\n"
+            "3. 验证通过 → 报告完成，结束任务\n"
+            "4. 验证失败 → 只修复报错部分，不要重读无关文件\n"
+        )
 
     return "\n".join(parts)
