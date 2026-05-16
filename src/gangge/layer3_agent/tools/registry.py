@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, Callable, Awaitable
 
 from gangge.layer3_agent.tools.base import BaseTool, ToolResult
 from gangge.layer5_llm.base import ToolDefinition
+
+logger = logging.getLogger(__name__)
 
 
 class ToolRegistry:
@@ -46,3 +49,45 @@ class ToolRegistry:
 
     def __contains__(self, name: str) -> bool:
         return name in self._tools
+
+
+def create_tool_registry(
+    workspace: str = "",
+    ask_user_callback: Callable[[str], Awaitable[str]] | None = None,
+    load_plugins: bool = True,
+) -> ToolRegistry:
+    """Create a ToolRegistry with all built-in tools registered.
+
+    This is the single source of truth for which tools are available.
+    Both CLI and GUI call this function — no duplicated registration logic.
+    """
+    from gangge.layer3_agent.tools.bash import BashTool
+    from gangge.layer3_agent.tools.file_ops import ReadFileTool, WriteFileTool, EditFileTool
+    from gangge.layer3_agent.tools.search import GrepTool, GlobTool, ListDirTool
+    from gangge.layer3_agent.tools.web import WebFetchTool
+    from gangge.layer3_agent.tools.ask_user import AskUserTool
+    from gangge.layer3_agent.tools.lint_check import LintCheckTool
+    from gangge.layer3_agent.tools.create_tool import CreateToolTool
+
+    registry = ToolRegistry()
+
+    registry.register(BashTool(workspace=workspace))
+    registry.register(ReadFileTool(workspace=workspace))
+    registry.register(WriteFileTool(workspace=workspace))
+    registry.register(EditFileTool(workspace=workspace))
+    registry.register(LintCheckTool(workspace=workspace))
+    for cls in [GrepTool, GlobTool, ListDirTool, WebFetchTool]:
+        registry.register(cls())
+
+    registry.register(AskUserTool(ask_callback=ask_user_callback))
+
+    create_tool = CreateToolTool(workspace=workspace, registry=registry)
+    registry.register(create_tool)
+
+    if load_plugins and workspace:
+        from gangge.layer4_tools.plugin_loader import load_plugins as _load_plugins
+        loaded = _load_plugins(workspace, registry)
+        if loaded:
+            logger.info("[Registry] loaded %d plugins: %s", len(loaded), loaded)
+
+    return registry

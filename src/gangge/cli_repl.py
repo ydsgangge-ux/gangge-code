@@ -180,11 +180,7 @@ async def execute_task(
     guard = PermissionGuard(ask_callback=ask_callback)
 
     # ── Tools ──
-    from gangge.layer3_agent.tools.bash import BashTool
-    from gangge.layer3_agent.tools.file_ops import ReadFileTool, WriteFileTool, EditFileTool
-    from gangge.layer3_agent.tools.search import GrepTool, GlobTool, ListDirTool
-    from gangge.layer3_agent.tools.web import WebFetchTool
-    from gangge.layer3_agent.tools.ask_user import AskUserTool
+    from gangge.layer3_agent.tools.registry import create_tool_registry
 
     async def _ask_user_callback(question: str) -> str:
         console.print(f"\n[yellow]❓ {question}[/yellow]")
@@ -194,13 +190,10 @@ async def execute_task(
             answer = ""
         return answer
 
-    registry = ToolRegistry()
-    for cls in [BashTool, ReadFileTool, WriteFileTool, EditFileTool,
-                 GrepTool, GlobTool, ListDirTool, WebFetchTool]:
-        registry.register(cls(workspace=workspace) if cls in (BashTool, ReadFileTool, WriteFileTool, EditFileTool) else cls())
-    from gangge.layer3_agent.tools.lint_check import LintCheckTool
-    registry.register(LintCheckTool(workspace=workspace))
-    registry.register(AskUserTool(ask_callback=_ask_user_callback))
+    registry = create_tool_registry(
+        workspace=workspace,
+        ask_user_callback=_ask_user_callback,
+    )
 
     # ── Config ──
     config = LoopConfig(

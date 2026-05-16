@@ -52,12 +52,14 @@ class ReadFileTool(BaseTool):
         limit = kwargs.get("limit", None)
 
         try:
-            # ── Resolve relative paths against workspace ──
             file_path = Path(path)
             if not file_path.is_absolute() and self.workspace:
                 file_path = Path(self.workspace) / path
             if not file_path.exists():
-                return ToolResult(output=f"文件不存在: {path}", is_error=True)
+                return ToolResult(
+                    output=f"文件不存在: {path}\n(已解析为: {file_path}，工作目录: {self.workspace})",
+                    is_error=True,
+                )
 
             if not file_path.is_file():
                 return ToolResult(output=f"不是文件: {path}", is_error=True)
@@ -205,12 +207,14 @@ class EditFileTool(BaseTool):
         new_str = kwargs["new_str"]
 
         try:
-            # ── Resolve relative paths against workspace ──
             file_path = Path(path)
             if not file_path.is_absolute() and self.workspace:
                 file_path = Path(self.workspace) / path
             if not file_path.exists():
-                return ToolResult(output=f"文件不存在: {path}", is_error=True)
+                return ToolResult(
+                    output=f"文件不存在: {path}\n(已解析为: {file_path}，工作目录: {self.workspace})",
+                    is_error=True,
+                )
 
             content = file_path.read_text(encoding="utf-8", errors="replace")
 

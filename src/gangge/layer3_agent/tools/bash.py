@@ -28,6 +28,7 @@ def _run_command(command: str, cwd: str, timeout: int) -> str:
 
     if platform.system() == "Windows":
         translated = _translate_to_powershell(command)
+        translated = f"chcp 65001 | Out-Null; {translated}"
         cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", translated]
     else:
         cmd = ["bash", "-c", command]
@@ -73,6 +74,14 @@ def _run_command(command: str, cwd: str, timeout: int) -> str:
         return f"[错误] {e}"
 
     result = output_buf.getvalue().strip()
+
+    MAX_OUTPUT = 3000
+    if len(result) > MAX_OUTPUT:
+        result = result[:MAX_OUTPUT] + (
+            f"\n\n...[输出已截断，共 {len(result)} 字符。"
+            f"建议使用 read_file 工具读取完整内容，或用 grep 搜索关键信息]"
+        )
+
     return result or "(无输出)"
 
 
